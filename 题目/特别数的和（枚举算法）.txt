@@ -1,0 +1,29 @@
+题目描述：统计1到 n 中所有包含数字 2、0、1 或 9 的数的和
+（不包括前导0，如 10 包含 1 和 0，应计入）。
+输入格式：一行，一个整数 n（1≤n≤1000）。
+输出格式：输出满足条件的数的总和。
+
+#include <iostream>
+using namespace std;
+bool hasSpecialDigit(int num) {  13
+    while (num > 0) {
+        int digit = num % 10;
+        if (digit == 2 || digit == 0 || digit == 1 || digit == 9) {
+            return true;
+        }
+        num /= 10;
+    }
+    return false;
+}
+int main() {
+    int n;
+    cin >> n; 15
+    int sum = 0;
+    for (int i = 1; i <= n; i++) {
+        if (hasSpecialDigit(i)) {
+            sum += i;
+        }
+    }
+    cout << sum << endl;
+    return 0;
+}
