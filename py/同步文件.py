@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-文件夹同步工具（GUI 版 · 多任务 · 只复制 · Git 源 · 系统托盘）
+文件夹同步工具（GUI 版 · 多任务 · 只复制 · Git 源 · 系统托盘 · 独立设置窗口）
+
+界面：
+  - 三块区域均可拖拽分隔线调整大小：任务列表 / 任务配置 / 日志
+  - 高级选项集中在“设置”窗口里（Toplevel），主界面保持简洁
+  - 支持系统托盘（需 pip install pystray Pillow）
 
 同步模式：
-  - 单向增量：A → B，只补新增/更新的
-  - 单向镜像：A → B，B 与 A 完全一致（会删除多余）
-  - 双向同步：A ↔ B，按修改时间互补
-  - 只复制  ：A ↔ B 双向补齐，同名跳过（不覆盖、不删除）
+  - 单向增量 / 单向镜像 / 双向同步 / 只复制（双向补齐，同名跳过）
 
 Git 源：
   源输入 Git 仓库地址时，先拉取到本地缓存再同步；只保留单向增量 / 单向镜像。
-
-系统托盘：
-  勾选“关闭窗口时最小化到系统托盘”后，点 X 会隐藏窗口到托盘。
-  托盘菜单：显示主窗口 / 立即同步 / 退出。
-  需要 pystray + Pillow：pip install pystray Pillow
-
-仅依赖 Python 标准库（tkinter）+ 可选的 pystray/Pillow（托盘功能）。
 """
 
 from __future__ import annotations
@@ -642,6 +637,7 @@ class SyncApp:
         cfg = load_config()
         self.profiles, last_selected = normalize_config(cfg)
 
+        # ---------- 运行时状态 ----------
         self.current_index: int | None = None
         self._suppress_select = False
         self._suppress_src_check = False
@@ -656,14 +652,17 @@ class SyncApp:
         self.sync_done_event.set()
 
         # ---------- 托盘 ----------
-        self.tray_icon = None                       # pystray.Icon 实例
-        self._allow_real_exit = False               # 托盘“退出”时置 True
+        self.tray_icon = None
+        self._allow_real_exit = False
         self._tray_hint_shown = False
         self.tray_enabled_var = tk.BooleanVar(
             value=bool(cfg.get("tray_enabled", True))
         )
 
-        # ---------- UI 变量 ----------
+        # ---------- 设置窗口 ----------
+        self.settings_window: tk.Toplevel | None = None
+
+        # ---------- 变量 ----------
         self.name_var = tk.StringVar()
         self.src_var = tk.StringVar()
         self.dst_var = tk.StringVar()
@@ -694,7 +693,7 @@ class SyncApp:
                 root.geometry("1120x830")
         else:
             root.geometry("1120x830")
-        root.minsize(980, 700)
+        root.minsize(900, 640)
 
         self.src_var.trace_add("write", self._on_src_var_changed)
 
@@ -704,21 +703,47 @@ class SyncApp:
         self._poll_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ---------------------------------------------------------------- UI --
+    # ==================================================================== UI ==
     def _build_ui(self) -> None:
         pad = {"padx": 8, "pady": 6}
 
-        paned = ttk.PanedWindow(self.root, orient="horizontal")
-        paned.pack(fill="both", expand=True, **pad)
+        # 主横向 PanedWindow：左（任务列表） | 右（配置 + 日志）
+        self.main_paned = ttk.PanedWindow(self.root, orient="horizontal")
+        self.main_paned.pack(fill="both", expand=True, **pad)
 
-        # ================ 左侧：任务列表 ================
-        left = ttk.Frame(paned)
-        paned.add(left, weight=0)
+        # ---------------- 左侧：任务列表 ----------------
+        left = ttk.Frame(self.main_paned)
+        self.main_paned.add(left, weight=0)
+        self._build_task_list_panel(left)
 
-        ttk.Label(left, text="同步任务", font=("", 10, "bold")) \
+        # ---------------- 右侧：纵向 PanedWindow ----------------
+        self.right_paned = ttk.PanedWindow(self.main_paned, orient="vertical")
+        self.main_paned.add(self.right_paned, weight=1)
+
+        # 右上：任务配置
+        config_panel = ttk.Frame(self.right_paned)
+        self.right_paned.add(config_panel, weight=3)
+        self._build_config_panel(config_panel)
+
+        # 右下：日志
+        log_panel = ttk.LabelFrame(self.right_paned, text="日志")
+        self.right_paned.add(log_panel, weight=2)
+        self._build_log_panel(log_panel)
+
+        # ---------------- 底部：按钮 + 进度 ----------------
+        self._build_bottom_bar()
+
+        # ---------------- 状态栏 ----------------
+        self.status_var = tk.StringVar(value="就绪")
+        ttk.Label(self.root, textvariable=self.status_var, anchor="w",
+                  relief="sunken").pack(fill="x", side="bottom")
+
+    # ------------------------------------------------------- 左侧：任务列表 --
+    def _build_task_list_panel(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="同步任务", font=("", 10, "bold")) \
             .pack(anchor="w", padx=4, pady=(2, 4))
 
-        tree_wrap = ttk.Frame(left)
+        tree_wrap = ttk.Frame(parent)
         tree_wrap.pack(fill="both", expand=True)
 
         self.task_tree = ttk.Treeview(
@@ -726,8 +751,8 @@ class SyncApp:
         )
         self.task_tree.heading("#0", text="任务名")
         self.task_tree.heading("mode", text="模式")
-        self.task_tree.column("#0", width=170, stretch=True, minwidth=120)
-        self.task_tree.column("mode", width=68, anchor="center", stretch=False)
+        self.task_tree.column("#0", width=160, stretch=True, minwidth=110)
+        self.task_tree.column("mode", width=64, anchor="center", stretch=False)
 
         tsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.task_tree.yview)
         self.task_tree.configure(yscrollcommand=tsb.set)
@@ -737,7 +762,7 @@ class SyncApp:
         self.task_tree.tag_configure("auto", foreground="#2471a3")
         self.task_tree.tag_configure("git", foreground="#8e44ad")
 
-        btn_row = ttk.Frame(left)
+        btn_row = ttk.Frame(parent)
         btn_row.pack(fill="x", pady=(6, 0))
         ttk.Button(btn_row, text="新建", width=6, command=self._new_task).pack(side="left")
         ttk.Button(btn_row, text="复制", width=6, command=self._duplicate_task).pack(side="left", padx=2)
@@ -747,18 +772,19 @@ class SyncApp:
         self.task_tree.bind("<<TreeviewSelect>>", self._on_task_select)
         self.task_tree.bind("<Double-1>", lambda e: self._rename_task())
 
-        # ================ 右侧：详情 ================
-        right = ttk.Frame(paned)
-        paned.add(right, weight=1)
-
-        nf = ttk.LabelFrame(right, text="任务")
+    # ------------------------------------------------------- 右上：任务配置 --
+    def _build_config_panel(self, parent: ttk.Frame) -> None:
+        # 任务名
+        nf = ttk.LabelFrame(parent, text="任务")
         nf.pack(fill="x", padx=4, pady=(0, 4))
         nf.columnconfigure(1, weight=1)
         ttk.Label(nf, text="名称：").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(nf, textvariable=self.name_var).grid(row=0, column=1, sticky="ew",
-                                                       padx=(0, 6), pady=6)
+        ttk.Entry(nf, textvariable=self.name_var).grid(
+            row=0, column=1, sticky="ew", padx=(0, 6), pady=6
+        )
 
-        pf = ttk.LabelFrame(right, text="源 / 目标")
+        # 源 / 目标
+        pf = ttk.LabelFrame(parent, text="源 / 目标")
         pf.pack(fill="x", padx=4, pady=4)
         pf.columnconfigure(1, weight=1)
 
@@ -779,8 +805,8 @@ class SyncApp:
         ttk.Button(pf, text="A、B 互换", command=self._swap) \
             .grid(row=3, column=2, sticky="e", padx=6, pady=(0, 6))
 
-        # ================ 同步模式 ================
-        mf = ttk.LabelFrame(right, text="同步模式")
+        # 同步模式
+        mf = ttk.LabelFrame(parent, text="同步模式")
         mf.pack(fill="x", padx=4, pady=4)
 
         rb = ttk.Radiobutton(mf, text="单向增量（A → B，只补新增/更新）",
@@ -806,44 +832,8 @@ class SyncApp:
         rb.pack(anchor="w", padx=8, pady=2)
         self.mode_buttons["copy_only"] = rb
 
-        # ================ 选项 ================
-        of = ttk.LabelFrame(right, text="选项")
-        of.pack(fill="x", padx=4, pady=4)
-
-        oleft = ttk.Frame(of)
-        oleft.pack(side="left", fill="both", expand=True, padx=6, pady=6)
-        ttk.Checkbutton(oleft, text="预览模式（不实际修改文件）",
-                        variable=self.dry_run_var).grid(row=0, column=0, sticky="w", pady=2)
-        ttk.Checkbutton(oleft, text="快速比较（只比大小和时间）",
-                        variable=self.fast_var).grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Checkbutton(oleft, text="删除文件后清理空目录",
-                        variable=self.clean_empty_var).grid(row=2, column=0, sticky="w", pady=2)
-        # 【托盘】最小化到托盘
-        ttk.Checkbutton(oleft, text="关闭窗口时最小化到系统托盘",
-                        variable=self.tray_enabled_var).grid(row=3, column=0, sticky="w", pady=2)
-
-        oright = ttk.Frame(of)
-        oright.pack(side="left", fill="both", expand=True, padx=6, pady=6)
-
-        r0 = ttk.Frame(oright); r0.pack(anchor="w", pady=2)
-        ttk.Label(r0, text="时间容差(秒)：").pack(side="left")
-        ttk.Entry(r0, textvariable=self.tolerance_var, width=8).pack(side="left")
-
-        r1 = ttk.Frame(oright); r1.pack(anchor="w", pady=2)
-        ttk.Label(r1, text="冲突处理：").pack(side="left")
-        ttk.Radiobutton(r1, text="跳过", variable=self.conflict_var,
-                        value="skip").pack(side="left", padx=(0, 8))
-        ttk.Radiobutton(r1, text="保留双方", variable=self.conflict_var,
-                        value="keep-both").pack(side="left")
-
-        r2 = ttk.Frame(oright); r2.pack(anchor="w", pady=2, fill="x")
-        ttk.Label(r2, text="排除规则：").pack(side="left")
-        ttk.Entry(r2, textvariable=self.exclude_var).pack(side="left", fill="x", expand=True)
-        ttk.Label(oright, text="（空格分隔，glob 语法：*.tmp  .git  __pycache__）",
-                  foreground="#666").pack(anchor="w")
-
-        # ================ 自动同步 ================
-        af = ttk.LabelFrame(right, text="自动同步（仅对当前任务生效）")
+        # 自动同步
+        af = ttk.LabelFrame(parent, text="自动同步（仅对当前任务生效）")
         af.pack(fill="x", padx=4, pady=4)
         arow = ttk.Frame(af); arow.pack(fill="x", padx=8, pady=6)
         ttk.Checkbutton(arow, text="开启自动同步",
@@ -854,37 +844,18 @@ class SyncApp:
         ttk.Label(arow, textvariable=self.auto_status,
                   foreground="#555").pack(side="left", padx=12)
 
-        # ================ 底部按钮 ================
-        bf = ttk.Frame(self.root)
-        bf.pack(fill="x", **pad)
+        # 一行小提示：其它高级选项已收进设置
+        hint = ttk.Frame(parent)
+        hint.pack(fill="x", padx=4, pady=(2, 0))
+        ttk.Label(hint,
+                  text="ⓘ 预览模式、快速比较、清理空目录、时间容差、冲突处理、排除规则、托盘开关均在「设置」里",
+                  foreground="#7f8c8d").pack(anchor="w")
 
-        self.start_btn = ttk.Button(bf, text="开始同步", command=self._start)
-        self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(bf, text="停止", command=self._stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=6)
-        ttk.Button(bf, text="保存设置", command=self._save_settings_clicked) \
-            .pack(side="left", padx=6)
-        ttk.Button(bf, text="清空日志", command=self._clear_log).pack(side="left", padx=6)
-        # 【托盘】托盘可用时提供“隐藏到托盘”按钮
-        ttk.Button(bf, text="隐藏到托盘", command=self._hide_to_tray) \
-            .pack(side="left", padx=6)
-
-        self.progress = ttk.Progressbar(bf, mode="determinate",
-                                        maximum=1, variable=self.progress_var)
-        self.progress.pack(side="right", fill="x", expand=True, padx=6)
-
-        pfl = ttk.Frame(self.root)
-        pfl.pack(fill="x", padx=10)
-        ttk.Label(pfl, textvariable=self.progress_label,
-                  anchor="w", foreground="#333").pack(side="left")
-
-        # ================ 日志 ================
-        lf = ttk.LabelFrame(self.root, text="日志")
-        lf.pack(fill="both", expand=True, **pad)
-
-        self.log_text = tk.Text(lf, wrap="none", height=12)
+    # ------------------------------------------------------- 右下：日志 --
+    def _build_log_panel(self, parent: ttk.LabelFrame) -> None:
+        self.log_text = tk.Text(parent, wrap="none", height=10)
         self.log_text.pack(side="left", fill="both", expand=True)
-        lsb = ttk.Scrollbar(lf, orient="vertical", command=self.log_text.yview)
+        lsb = ttk.Scrollbar(parent, orient="vertical", command=self.log_text.yview)
         lsb.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=lsb.set)
 
@@ -897,12 +868,166 @@ class SyncApp:
         self.log_text.tag_configure("tray", foreground="#16a085")
         self.log_text.tag_configure("info", foreground="#7f8c8d")
 
+    # ------------------------------------------------------- 底部按钮栏 --
+    def _build_bottom_bar(self) -> None:
+        pad = {"padx": 8, "pady": 6}
+        bf = ttk.Frame(self.root)
+        bf.pack(fill="x", **pad)
+
+        self.start_btn = ttk.Button(bf, text="开始同步", command=self._start)
+        self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(bf, text="停止", command=self._stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=6)
+
+        ttk.Button(bf, text="设置…", command=self._open_settings).pack(side="left", padx=6)
+        ttk.Button(bf, text="保存设置", command=self._save_settings_clicked).pack(side="left", padx=6)
+        ttk.Button(bf, text="清空日志", command=self._clear_log).pack(side="left", padx=6)
+        ttk.Button(bf, text="隐藏到托盘", command=self._hide_to_tray).pack(side="left", padx=6)
+
+        self.progress = ttk.Progressbar(bf, mode="determinate",
+                                        maximum=1, variable=self.progress_var)
+        self.progress.pack(side="right", fill="x", expand=True, padx=6)
+
+        # 进度文字单独一行
+        pfl = ttk.Frame(self.root)
+        pfl.pack(fill="x", padx=10)
+        ttk.Label(pfl, textvariable=self.progress_label,
+                  anchor="w", foreground="#333").pack(side="left")
+
+        # 配置文件路径
         ttk.Label(self.root, text=f"配置文件：{self.config_path}",
                   anchor="w", foreground="#7f8c8d").pack(fill="x", padx=10, pady=(2, 0))
 
-        self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(self.root, textvariable=self.status_var, anchor="w",
-                  relief="sunken").pack(fill="x", side="bottom")
+    # ================================================== 设置窗口（Toplevel） ==
+    def _open_settings(self) -> None:
+        # 已经打开 → 提到前面
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            self.settings_window.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_TITLE} · 设置")
+        win.transient(self.root)
+        win.resizable(True, True)
+        self.settings_window = win
+        win.protocol("WM_DELETE_WINDOW", self._close_settings)
+
+        self._build_settings_ui(win)
+
+        # 打开时保存当前 UI 到 profile，确保设置里显示的与主界面一致
+        if self.current_index is not None:
+            self._save_ui_to_profile(self.current_index)
+            self._refresh_task_item(self.current_index)
+
+        # 计算窗口位置：贴主窗口右侧
+        win.update_idletasks()
+        w, h = 560, 580
+        x = self.root.winfo_x() + self.root.winfo_width() - w - 60
+        y = self.root.winfo_y() + 80
+        # 若超出屏幕右侧，则居中显示
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        if x + w > sw - 20:
+            x = max(20, (sw - w) // 2)
+        if y + h > sh - 40:
+            y = max(20, (sh - h) // 2)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+        # 聚焦设置窗口
+        win.focus_force()
+
+    def _close_settings(self) -> None:
+        # 保存
+        if self.current_index is not None:
+            self._refresh_task_item(self.current_index)
+        self._save_settings()
+
+        # 销毁窗口
+        if self.settings_window is not None:
+            try:
+                self.settings_window.destroy()
+            except tk.TclError:
+                pass
+            self.settings_window = None
+
+    def _build_settings_ui(self, win: tk.Toplevel) -> None:
+        pad = {"padx": 12, "pady": 8}
+
+        # ---------------- 全局设置 ----------------
+        gf = ttk.LabelFrame(win, text="全局设置")
+        gf.pack(fill="x", **pad)
+
+        ttk.Checkbutton(
+            gf, text="关闭窗口时最小化到系统托盘",
+            variable=self.tray_enabled_var,
+        ).pack(anchor="w", padx=10, pady=(8, 2))
+
+        if self._pystray_available():
+            ttk.Label(
+                gf,
+                text="勾选后，点击主窗口右上角的 × 会隐藏到系统托盘；\n"
+                     "托盘图标：双击恢复窗口，右键菜单可立即同步 / 退出。",
+                foreground="#666", justify="left",
+            ).pack(anchor="w", padx=10, pady=(0, 8))
+        else:
+            ttk.Label(
+                gf,
+                text="⚠ 未检测到 pystray / Pillow，托盘功能不可用。\n"
+                     "  安装命令：pip install pystray Pillow",
+                foreground="#c0392b", justify="left",
+            ).pack(anchor="w", padx=10, pady=(0, 8))
+
+        # ---------------- 当前任务选项 ----------------
+        tf = ttk.LabelFrame(win, text="当前任务的同步选项")
+        tf.pack(fill="both", expand=True, **pad)
+
+        # 复选框
+        cb = ttk.Frame(tf)
+        cb.pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Checkbutton(cb, text="预览模式（不实际修改文件）",
+                        variable=self.dry_run_var).pack(anchor="w", pady=2)
+        ttk.Checkbutton(cb, text="快速比较（只比大小和时间，不做内容哈希）",
+                        variable=self.fast_var).pack(anchor="w", pady=2)
+        ttk.Checkbutton(cb, text="删除文件后清理空目录",
+                        variable=self.clean_empty_var).pack(anchor="w", pady=2)
+
+        ttk.Separator(tf, orient="horizontal").pack(fill="x", padx=10, pady=8)
+
+        # 时间容差
+        r1 = ttk.Frame(tf); r1.pack(fill="x", padx=10, pady=4)
+        ttk.Label(r1, text="时间容差(秒)：").pack(side="left")
+        ttk.Entry(r1, textvariable=self.tolerance_var, width=8).pack(side="left")
+        ttk.Label(r1, text="  （兼容 FAT 等低精度文件系统，默认 2）",
+                  foreground="#888").pack(side="left")
+
+        # 冲突处理
+        r2 = ttk.Frame(tf); r2.pack(fill="x", padx=10, pady=4)
+        ttk.Label(r2, text="冲突处理：").pack(side="left")
+        ttk.Radiobutton(r2, text="跳过", variable=self.conflict_var,
+                        value="skip").pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(r2, text="保留双方", variable=self.conflict_var,
+                        value="keep-both").pack(side="left")
+        ttk.Label(tf,
+                  text="（仅双向同步遇到“时间相同但内容不同”时生效）",
+                  foreground="#888").pack(anchor="w", padx=10)
+
+        # 排除规则
+        r3 = ttk.Frame(tf); r3.pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Label(r3, text="排除规则：").pack(side="left")
+        ttk.Entry(r3, textvariable=self.exclude_var).pack(
+            side="left", fill="x", expand=True
+        )
+        ttk.Label(tf,
+                  text="多个用空格分隔，glob 语法：*.tmp  .git  __pycache__",
+                  foreground="#888").pack(anchor="w", padx=10)
+
+        # ---------------- 底部按钮 ----------------
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", pady=10)
+
+        ttk.Button(bf, text="关闭", command=self._close_settings) \
+            .pack(side="right", padx=12)
 
     # ====================================================== Git 源检测 ==
     def _on_src_var_changed(self, *_args) -> None:
@@ -953,21 +1078,16 @@ class SyncApp:
 
     @staticmethod
     def _make_tray_image():
-        """用 PIL 画一个简单的文件夹图标（无外部资源）。"""
         from PIL import Image, ImageDraw
         size = 64
         img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        # 文件夹主色
         main = (41, 128, 185, 255)
-        # 文件夹标签（上半部分）
         d.rounded_rectangle([6, 10, 30, 24], radius=3, fill=main)
-        # 文件夹主体
         d.rounded_rectangle([6, 18, size - 6, size - 8], radius=5, fill=main)
         return img
 
     def _ensure_tray(self) -> bool:
-        """懒加载托盘图标。返回是否可用。"""
         if self.tray_icon is not None:
             return True
         if not self._pystray_available():
@@ -990,7 +1110,6 @@ class SyncApp:
         )
         try:
             icon = pystray.Icon("folder_sync", image, APP_TITLE, menu)
-            # 在后台线程运行托盘消息循环
             threading.Thread(target=icon.run, daemon=True).start()
             self.tray_icon = icon
             self.msg_queue.put("[托盘]   已启动系统托盘图标")
@@ -1001,9 +1120,7 @@ class SyncApp:
         return True
 
     def _hide_to_tray(self) -> None:
-        """隐藏窗口到托盘。"""
         if not self.tray_enabled_var.get():
-            # 用户没开启托盘 → 直接忽略，不做任何隐藏
             self.msg_queue.put("[托盘]  未开启“关闭时最小化到托盘”，无法隐藏")
             return
         if not self._ensure_tray():
@@ -1017,7 +1134,6 @@ class SyncApp:
         self._save_settings()
         self.root.withdraw()
 
-        # 首次隐藏时，弹一次气泡提示
         if not self._tray_hint_shown and self.tray_icon is not None:
             self._tray_hint_shown = True
             try:
@@ -1038,7 +1154,6 @@ class SyncApp:
         except tk.TclError:
             pass
 
-    # ---- 托盘菜单回调（在托盘线程里执行，需切回主线程） ----
     def _tray_on_show(self, icon=None, item=None) -> None:
         self.root.after(0, self._restore_window)
 
@@ -1380,7 +1495,7 @@ class SyncApp:
             if tolerance < 0:
                 raise ValueError
         except ValueError:
-            messagebox.showerror(APP_TITLE, "时间容差必须是 ≥ 0 的数字")
+            messagebox.showerror(APP_TITLE, "时间容差必须是 ≥ 0 的数字（可在「设置」里修改）")
             return None
 
         excludes = self.exclude_var.get().split()
@@ -1568,7 +1683,6 @@ class SyncApp:
         self.status_var.set("完成" if s.errors == 0 else f"完成（{s.errors} 个错误）")
         self.progress_label.set("已完成")
 
-        # 托盘气泡：仅在窗口隐藏时提示
         if self.tray_icon is not None and not self.root.winfo_viewable():
             try:
                 if s.errors:
@@ -1722,6 +1836,10 @@ class SyncApp:
 
     # ====================================================== 关闭 ==
     def _on_close(self) -> None:
+        # 先关闭设置窗口（如果开着）
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self._close_settings()
+
         # 托盘可用 + 开关打开 + 不是托盘“退出”菜单 → 隐藏到托盘
         if self._tray_should_enable() and not self._allow_real_exit:
             self._save_settings()

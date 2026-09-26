@@ -1,21 +1,22 @@
 {
   "version": 2,
   "last_selected": 1,
-  "window_geometry": "1120x780+409+193",
+  "window_geometry": "980x790+118+45",
+  "tray_enabled": true,
   "profiles": [
     {
-      "name": "默认任务",
+      "name": "同步音乐",
       "src": "D:/音乐",
       "dst": "F:/音乐",
       "mode": "one_way",
       "dry_run": false,
       "fast": false,
-      "clean_empty_dirs": false,
+      "clean_empty_dirs": true,
       "conflict": "skip",
       "tolerance": "2",
       "excludes": "",
       "auto_sync": true,
-      "auto_interval": "1"
+      "auto_interval": "5"
     },
     {
       "name": "编程",
