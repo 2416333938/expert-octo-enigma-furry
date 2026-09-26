@@ -7,7 +7,7 @@ a.out
 # 过大的 Scratch 工程（386 MB，超出 GitHub 单文件 100 MB 限制）
 # 本地保留，不纳入版本控制
 sb3/宝可梦GUI.sb3
-
+py/sync_config.json
 # 系统 / 编辑器
 Thumbs.db
 desktop.ini
