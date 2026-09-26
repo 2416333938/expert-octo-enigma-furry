@@ -28,7 +28,7 @@
       "conflict": "skip",
       "tolerance": "2",
       "excludes": "",
-      "auto_sync": false,
+      "auto_sync": true,
       "auto_interval": "5"
     }
   ]

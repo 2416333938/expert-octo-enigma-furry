@@ -14,3 +14,4 @@ desktop.ini
 .vs/
 .vscode/
 *.swp
+py/sync_config.json

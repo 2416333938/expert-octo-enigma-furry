@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-文件夹同步工具（GUI 版 · 多任务 · 支持“只复制”模式）
+文件夹同步工具（GUI 版 · 多任务 · 支持“只复制” · 支持 Git 源）
 
 同步模式：
   - 单向增量：A → B，只补新增/更新的（内容或时间不同会覆盖）
@@ -9,7 +9,13 @@
   - 双向同步：A ↔ B，按修改时间互补（较新覆盖较旧）
   - 只复制  ：A ↔ B，双向补齐缺失文件；同名一律跳过（不覆盖、不删除）
 
-仅依赖 Python 标准库（tkinter），无需 pip 安装。
+Git 源：
+  当“源”输入的是 Git 仓库地址（https://...、git@...、ssh://... 等）时，
+  程序会先把仓库拉取到本地缓存，再按所选模式同步到目标文件夹。
+  由于远程仓库不能直接被写回，此时只保留“单向增量 / 单向镜像”。
+
+仅依赖 Python 标准库（tkinter），无需 pip 安装；
+Git 源功能需要系统已安装 git 并加入 PATH。
 """
 
 from __future__ import annotations
@@ -19,8 +25,11 @@ import hashlib
 import json
 import os
 import queue
+import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -33,6 +42,128 @@ APP_TITLE = "文件夹同步工具"
 
 CONFIG_FILENAME = "sync_config.json"
 CONFIG_VERSION = 2
+
+
+# =========================================================================== #
+# Git 支持
+# =========================================================================== #
+
+# 常见 Git URL 形式
+_GIT_URL_PATTERNS = [
+    re.compile(r"^https?://.+\.git/?$", re.I),
+    re.compile(r"^https?://(github\.com|gitlab\.com|gitee\.com|bitbucket\.org|codeberg\.org)/[\w.\-]+/[\w.\-]+/?$", re.I),
+    re.compile(r"^git@[\w.\-]+:[\w./\-]+(\.git)?$", re.I),
+    re.compile(r"^ssh://[\w@.\-:]+/[\w./\-]+(\.git)?$", re.I),
+    re.compile(r"^git://[\w.\-:]+/[\w./\-]+$", re.I),
+    re.compile(r"^file://.+\.git/?$", re.I),
+]
+
+
+def is_git_url(s: str) -> bool:
+    """粗略判断字符串是否像 Git 仓库地址。"""
+    s = (s or "").strip()
+    if not s or " " in s:
+        return False
+    # 排除 Windows 盘符路径 C:\xxx
+    if re.match(r"^[A-Za-z]:[\\/]", s):
+        return False
+    return any(p.match(s) for p in _GIT_URL_PATTERNS)
+
+
+def run_git(args: list[str], cwd=None, timeout: int = 300):
+    """执行 git 命令。返回 (returncode, stdout, stderr)。"""
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    try:
+        r = subprocess.run(
+            ["git"] + args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            **kwargs,
+        )
+        return r.returncode, r.stdout or "", r.stderr or ""
+    except FileNotFoundError:
+        return 127, "", "未找到 git 命令，请安装 Git 并加入 PATH"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"git 操作超时（>{timeout}s）"
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def git_available() -> bool:
+    return shutil.which("git") is not None
+
+
+def git_cache_dir(url: str) -> Path:
+    """为 URL 生成一个稳定的缓存目录。"""
+    h = hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
+    name = url.rstrip("/").split("/")[-1].split(":")[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    name = re.sub(r"[^\w.\-]", "_", name) or "repo"
+    base = Path(tempfile.gettempdir()) / "folder_sync_git_cache"
+    return base / f"{name}_{h}"
+
+
+def ensure_git_repo(url: str, cache_dir: Path, log) -> tuple[bool, str]:
+    """保证缓存目录是最新仓库内容。返回 (成功, 错误)。"""
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # 首次：clone
+    if not (cache_dir / ".git").exists():
+        if cache_dir.exists():
+            try:
+                shutil.rmtree(cache_dir)
+            except OSError as exc:
+                return False, f"无法清理缓存目录：{exc}"
+        log(f"[GIT]    正在克隆 {url} …")
+        rc, out, err = run_git(["clone", url, str(cache_dir)], timeout=900)
+        if rc != 0:
+            return False, f"git clone 失败：{(err or out).strip()}"
+        log("[GIT]    克隆完成")
+        return True, ""
+
+    # 已有缓存：pull
+    log("[GIT]    拉取更新 …")
+    rc, out, err = run_git(["-C", str(cache_dir), "pull", "--ff-only"], timeout=600)
+    if rc != 0:
+        log("[GIT]    pull --ff-only 失败，尝试强制同步 …")
+        rc2, _o2, _e2 = run_git(
+            ["-C", str(cache_dir), "fetch", "--all", "--prune"], timeout=600
+        )
+        if rc2 != 0:
+            return False, f"git fetch 失败：{(err or out).strip()}"
+
+        # 依次尝试 origin/HEAD、origin/main、origin/master
+        target = None
+        rc3, out3, _e3 = run_git(
+            ["-C", str(cache_dir), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            timeout=30,
+        )
+        if rc3 == 0 and out3.strip():
+            target = out3.strip()
+        else:
+            for b in ("origin/main", "origin/master"):
+                rc4, _o4, _e4 = run_git(
+                    ["-C", str(cache_dir), "rev-parse", "--verify", b], timeout=30
+                )
+                if rc4 == 0:
+                    target = b
+                    break
+        if target is None:
+            return False, f"git 更新失败，无法确定远程分支：{(err or out).strip()}"
+
+        rc5, out5, err5 = run_git(
+            ["-C", str(cache_dir), "reset", "--hard", target], timeout=120
+        )
+        if rc5 != 0:
+            return False, f"git reset 失败：{(err5 or out5).strip()}"
+
+    log("[GIT]    更新完成")
+    return True, ""
 
 
 # =========================================================================== #
@@ -72,7 +203,7 @@ def save_config(data: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 任务配置：默认值 / 规范化
+# 任务配置
 # --------------------------------------------------------------------------- #
 
 VALID_MODES = ("one_way", "mirror", "two_way", "copy_only")
@@ -332,19 +463,11 @@ def plan_mirror(src: Path, dst: Path, ctx: "Ctx", excluded) -> Plan:
     return plan
 
 
-# 【修改】只复制：A ↔ B 双向补齐；同名一律跳过
 def plan_copy_only(a: Path, b: Path, ctx: "Ctx", excluded) -> Plan:
-    """
-    只复制（双向补齐）：
-      - A 有、B 没有 → 复制 A → B
-      - B 有、A 没有 → 复制 B → A
-      - A、B 都有（同名）→ 一律跳过，不比内容、不覆盖、不删除
-    """
     plan = Plan()
     a_map = scan(a, excluded)
     b_map = scan(b, excluded)
 
-    # A → B：只复制 B 里不存在的
     for rel in sorted(a_map):
         if ctx._stopped():
             return plan
@@ -353,7 +476,6 @@ def plan_copy_only(a: Path, b: Path, ctx: "Ctx", excluded) -> Plan:
         else:
             plan.skipped += 1
 
-    # B → A：只复制 A 里不存在的
     for rel in sorted(b_map):
         if ctx._stopped():
             return plan
@@ -514,7 +636,6 @@ def execute_plan(plan: Plan, ctx: Ctx, progress_callback=None) -> None:
 # =========================================================================== #
 
 MODE_SHORT = {"one_way": "增量", "mirror": "镜像", "two_way": "双向", "copy_only": "只复制"}
-# 【修改】只复制的长描述
 MODE_LONG = {
     "one_way": "单向增量",
     "mirror": "单向镜像",
@@ -534,6 +655,7 @@ class SyncApp:
 
         self.current_index: int | None = None
         self._suppress_select = False
+        self._suppress_src_check = False
         self.msg_queue: queue.Queue[str] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.monitor_thread: threading.Thread | None = None
@@ -560,6 +682,10 @@ class SyncApp:
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_label = tk.StringVar(value="")
         self.auto_status = tk.StringVar(value="未开启")
+        self.git_hint_var = tk.StringVar(value="")
+
+        # 保存模式单选按钮引用，便于根据 Git 源启用/禁用
+        self.mode_buttons: dict[str, ttk.Radiobutton] = {}
 
         self._build_ui()
 
@@ -568,10 +694,13 @@ class SyncApp:
             try:
                 root.geometry(geom)
             except tk.TclError:
-                root.geometry("1120x800")
+                root.geometry("1120x820")
         else:
-            root.geometry("1120x800")
-        root.minsize(980, 680)
+            root.geometry("1120x820")
+        root.minsize(980, 700)
+
+        # 源输入变化时检测 Git 地址
+        self.src_var.trace_add("write", self._on_src_var_changed)
 
         self._refresh_task_list()
         self._select_task(last_selected, force=True)
@@ -610,6 +739,7 @@ class SyncApp:
         tsb.pack(side="right", fill="y")
 
         self.task_tree.tag_configure("auto", foreground="#2471a3")
+        self.task_tree.tag_configure("git", foreground="#8e44ad")
 
         btn_row = ttk.Frame(left)
         btn_row.pack(fill="x", pady=(6, 0))
@@ -632,42 +762,56 @@ class SyncApp:
         ttk.Entry(nf, textvariable=self.name_var).grid(row=0, column=1, sticky="ew",
                                                        padx=(0, 6), pady=6)
 
-        pf = ttk.LabelFrame(right, text="文件夹")
+        pf = ttk.LabelFrame(right, text="源 / 目标")
         pf.pack(fill="x", padx=4, pady=4)
         pf.columnconfigure(1, weight=1)
 
-        ttk.Label(pf, text="源文件夹 A：").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(pf, text="源 A：").grid(row=0, column=0, sticky="w", padx=6, pady=6)
         ttk.Entry(pf, textvariable=self.src_var).grid(row=0, column=1, sticky="ew")
         ttk.Button(pf, text="浏览…", command=lambda: self._pick_dir(self.src_var)) \
             .grid(row=0, column=2, padx=6)
 
-        ttk.Label(pf, text="目标文件夹 B：").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(pf, textvariable=self.dst_var).grid(row=1, column=1, sticky="ew")
+        # Git 提示
+        ttk.Label(pf, textvariable=self.git_hint_var,
+                  foreground="#8e44ad", wraplength=560, justify="left") \
+            .grid(row=1, column=1, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+
+        ttk.Label(pf, text="目标 B：").grid(row=2, column=0, sticky="w", padx=6, pady=6)
+        ttk.Entry(pf, textvariable=self.dst_var).grid(row=2, column=1, sticky="ew")
         ttk.Button(pf, text="浏览…", command=lambda: self._pick_dir(self.dst_var)) \
-            .grid(row=1, column=2, padx=6)
+            .grid(row=2, column=2, padx=6)
 
         ttk.Button(pf, text="A、B 互换", command=self._swap) \
-            .grid(row=2, column=2, sticky="e", padx=6, pady=(0, 6))
+            .grid(row=3, column=2, sticky="e", padx=6, pady=(0, 6))
 
         # ================ 同步模式 ================
         mf = ttk.LabelFrame(right, text="同步模式")
         mf.pack(fill="x", padx=4, pady=4)
 
-        ttk.Radiobutton(mf, text="单向增量（A → B，只补新增/更新）",
-                        variable=self.mode_var, value="one_way").pack(anchor="w", padx=8, pady=2)
-        ttk.Radiobutton(mf, text="单向镜像（A → B，B 中多余文件会被删除）",
-                        variable=self.mode_var, value="mirror").pack(anchor="w", padx=8, pady=2)
-        ttk.Radiobutton(mf, text="双向同步（A ↔ B，较新覆盖较旧）",
-                        variable=self.mode_var, value="two_way").pack(anchor="w", padx=8, pady=2)
+        rb = ttk.Radiobutton(mf, text="单向增量（A → B，只补新增/更新）",
+                             variable=self.mode_var, value="one_way")
+        rb.pack(anchor="w", padx=8, pady=2)
+        self.mode_buttons["one_way"] = rb
 
-        # 【修改】只复制模式的描述
+        rb = ttk.Radiobutton(mf, text="单向镜像（A → B，B 中多余文件会被删除）",
+                             variable=self.mode_var, value="mirror")
+        rb.pack(anchor="w", padx=8, pady=2)
+        self.mode_buttons["mirror"] = rb
+
+        rb = ttk.Radiobutton(mf, text="双向同步（A ↔ B，较新覆盖较旧）",
+                             variable=self.mode_var, value="two_way")
+        rb.pack(anchor="w", padx=8, pady=2)
+        self.mode_buttons["two_way"] = rb
+
         copy_row = ttk.Frame(mf)
         copy_row.pack(anchor="w", padx=8, pady=2, fill="x")
-        ttk.Radiobutton(
+        rb = ttk.Radiobutton(
             copy_row,
             text="只复制（A ↔ B 双向补齐：把彼此缺失的文件复制给对方；同名一律跳过）",
             variable=self.mode_var, value="copy_only",
-        ).pack(side="left")
+        )
+        rb.pack(side="left")
+        self.mode_buttons["copy_only"] = rb
         ttk.Label(copy_row, text="  ← 不删除、不覆盖，最安全",
                   foreground="#1e8449").pack(side="left")
 
@@ -752,6 +896,7 @@ class SyncApp:
         self.log_text.tag_configure("delete", foreground="#c0392b")
         self.log_text.tag_configure("conflict", foreground="#b9770e")
         self.log_text.tag_configure("auto", foreground="#2471a3")
+        self.log_text.tag_configure("git", foreground="#8e44ad")
         self.log_text.tag_configure("info", foreground="#7f8c8d")
 
         ttk.Label(self.root, text=f"配置文件：{self.config_path}",
@@ -761,29 +906,82 @@ class SyncApp:
         ttk.Label(self.root, textvariable=self.status_var, anchor="w",
                   relief="sunken").pack(fill="x", side="bottom")
 
+    # ====================================================== Git 源检测 ==
+    def _on_src_var_changed(self, *_args) -> None:
+        if self._suppress_src_check:
+            return
+        self._update_git_mode_lock()
+
+    def _update_git_mode_lock(self) -> None:
+        """根据源是否为 Git 地址，禁用/恢复相关模式按钮。"""
+        src_text = self.src_var.get().strip()
+        is_url = is_git_url(src_text)
+
+        # 双向 / 只复制在 Git 源下不可用
+        for key in ("two_way", "copy_only"):
+            btn = self.mode_buttons.get(key)
+            if btn is not None:
+                try:
+                    btn.configure(state="disabled" if is_url else "normal")
+                except tk.TclError:
+                    pass
+
+        if is_url:
+            if not git_available():
+                self.git_hint_var.set(
+                    "⚠ 检测到 Git 仓库地址，但系统未找到 git 命令。\n"
+                    "  请安装 Git 并将其加入 PATH 后再试。"
+                )
+            else:
+                self.git_hint_var.set(
+                    "ⓘ 检测到 Git 仓库地址：会先拉取到本地缓存再同步。\n"
+                    "  该来源只支持「单向增量 / 单向镜像」。"
+                )
+            if self.mode_var.get() in ("two_way", "copy_only"):
+                self.mode_var.set("one_way")
+        else:
+            self.git_hint_var.set("")
+
     # ====================================================== 任务列表操作 ==
     def _refresh_task_list(self) -> None:
         self.task_tree.delete(*self.task_tree.get_children())
         for i, p in enumerate(self.profiles):
-            name = p.get("name") or f"任务 {i + 1}"
-            display = ("● " if p.get("auto_sync") else "") + name
-            tags = ("auto",) if p.get("auto_sync") else ()
-            self.task_tree.insert(
-                "", "end", iid=str(i),
-                text=display, values=(MODE_SHORT.get(p.get("mode"), "增量"),),
-                tags=tags,
-            )
+            self._insert_task_item(i, p)
+
+    def _insert_task_item(self, i: int, p: dict) -> None:
+        name = p.get("name") or f"任务 {i + 1}"
+        prefix = "● " if p.get("auto_sync") else ""
+        if is_git_url(p.get("src", "")):
+            prefix += "⎇ "
+        display = prefix + name
+        tags = []
+        if p.get("auto_sync"):
+            tags.append("auto")
+        if is_git_url(p.get("src", "")):
+            tags.append("git")
+        self.task_tree.insert(
+            "", "end", iid=str(i),
+            text=display, values=(MODE_SHORT.get(p.get("mode"), "增量"),),
+            tags=tuple(tags),
+        )
 
     def _refresh_task_item(self, idx: int) -> None:
         if not self.task_tree.exists(str(idx)):
             return
         p = self.profiles[idx]
         name = p.get("name") or f"任务 {idx + 1}"
-        display = ("● " if p.get("auto_sync") else "") + name
-        tags = ("auto",) if p.get("auto_sync") else ()
+        prefix = "● " if p.get("auto_sync") else ""
+        if is_git_url(p.get("src", "")):
+            prefix += "⎇ "
+        display = prefix + name
+        tags = []
+        if p.get("auto_sync"):
+            tags.append("auto")
+        if is_git_url(p.get("src", "")):
+            tags.append("git")
         self.task_tree.item(str(idx), text=display,
                             values=(MODE_SHORT.get(p.get("mode"), "增量"),),
-                            tags=tags)
+                            tags=tuple(tags))
 
     def _on_task_select(self, _event=None) -> None:
         if self._suppress_select:
@@ -907,18 +1105,24 @@ class SyncApp:
     # ====================================================== Profile <-> UI ==
     def _load_profile_to_ui(self, idx: int) -> None:
         p = self.profiles[idx]
-        self.name_var.set(p.get("name", ""))
-        self.src_var.set(p.get("src", ""))
-        self.dst_var.set(p.get("dst", ""))
-        self.mode_var.set(p.get("mode", "one_way"))
-        self.dry_run_var.set(bool(p.get("dry_run", False)))
-        self.fast_var.set(bool(p.get("fast", False)))
-        self.clean_empty_var.set(bool(p.get("clean_empty_dirs", True)))
-        self.conflict_var.set(p.get("conflict", "skip"))
-        self.tolerance_var.set(p.get("tolerance", "2"))
-        self.exclude_var.set(p.get("excludes", ""))
-        self.auto_sync_var.set(bool(p.get("auto_sync", False)))
-        self.auto_interval_var.set(p.get("auto_interval", "5"))
+        self._suppress_src_check = True
+        try:
+            self.name_var.set(p.get("name", ""))
+            self.src_var.set(p.get("src", ""))
+            self.dst_var.set(p.get("dst", ""))
+            self.mode_var.set(p.get("mode", "one_way"))
+            self.dry_run_var.set(bool(p.get("dry_run", False)))
+            self.fast_var.set(bool(p.get("fast", False)))
+            self.clean_empty_var.set(bool(p.get("clean_empty_dirs", True)))
+            self.conflict_var.set(p.get("conflict", "skip"))
+            self.tolerance_var.set(p.get("tolerance", "2"))
+            self.exclude_var.set(p.get("excludes", ""))
+            self.auto_sync_var.set(bool(p.get("auto_sync", False)))
+            self.auto_interval_var.set(p.get("auto_interval", "5"))
+        finally:
+            self._suppress_src_check = False
+        # 根据新的 src 更新模式可用性
+        self._update_git_mode_lock()
 
     def _save_ui_to_profile(self, idx: int) -> None:
         p = self.profiles[idx]
@@ -987,6 +1191,8 @@ class SyncApp:
             tag = "conflict"
         elif "[自动]" in text:
             tag = "auto"
+        elif "[GIT]" in text:
+            tag = "git"
         elif "[信息]" in text or "[准备]" in text:
             tag = "info"
         self.log_text.insert("end", text + "\n", tag or ())
@@ -1003,27 +1209,51 @@ class SyncApp:
 
     # ====================================================== 校验 ==
     def _validate_inputs(self):
+        """
+        返回 (src, dst, tolerance, excludes, is_url) 或 None。
+        src 为 Git 地址时是 str，本地时是 Path。
+        """
         src_text = self.src_var.get().strip()
         dst_text = self.dst_var.get().strip()
         if not src_text:
-            messagebox.showwarning(APP_TITLE, "请选择源文件夹 A")
+            messagebox.showwarning(APP_TITLE, "请选择源文件夹或输入 Git 地址")
             return None
         if not dst_text:
-            messagebox.showwarning(APP_TITLE, "请选择目标文件夹 B")
+            messagebox.showwarning(APP_TITLE, "请选择目标文件夹")
             return None
 
-        src = Path(src_text).expanduser().resolve()
+        is_url = is_git_url(src_text)
+
+        if is_url:
+            if not git_available():
+                messagebox.showerror(
+                    APP_TITLE,
+                    "检测到 Git 仓库地址，但系统未找到 git 命令。\n"
+                    "请安装 Git 并确保它在 PATH 中。"
+                )
+                return None
+            # 若当前模式是双向或只复制，强制改回单向增量
+            if self.mode_var.get() in ("two_way", "copy_only"):
+                self.mode_var.set("one_way")
+            src = src_text
+        else:
+            src = Path(src_text).expanduser().resolve()
+            if not src.exists() or not src.is_dir():
+                messagebox.showerror(APP_TITLE, f"源文件夹不存在或不是文件夹：\n{src}")
+                return None
+
         dst = Path(dst_text).expanduser().resolve()
+        if dst.exists() and not dst.is_dir():
+            messagebox.showerror(APP_TITLE, f"目标路径已存在但不是文件夹：\n{dst}")
+            return None
 
-        if not src.exists() or not src.is_dir():
-            messagebox.showerror(APP_TITLE, f"源文件夹不存在或不是文件夹：\n{src}")
-            return None
-        if src == dst:
-            messagebox.showerror(APP_TITLE, "两个路径不能相同")
-            return None
-        if is_subpath(src, dst) or is_subpath(dst, src):
-            messagebox.showerror(APP_TITLE, "两个文件夹不能互相包含")
-            return None
+        if not is_url:
+            if src == dst:
+                messagebox.showerror(APP_TITLE, "两个路径不能相同")
+                return None
+            if is_subpath(src, dst) or is_subpath(dst, src):
+                messagebox.showerror(APP_TITLE, "两个文件夹不能互相包含")
+                return None
 
         try:
             tolerance = float(self.tolerance_var.get())
@@ -1034,7 +1264,7 @@ class SyncApp:
             return None
 
         excludes = self.exclude_var.get().split()
-        return src, dst, tolerance, excludes
+        return src, dst, tolerance, excludes, is_url
 
     # ====================================================== 开始同步 ==
     def _start(self, from_auto: bool = False) -> bool:
@@ -1047,11 +1277,10 @@ class SyncApp:
                 self.msg_queue.put("[自动]  参数无效，自动同步已跳过")
             return False
 
-        src, dst, tolerance, excludes = result
+        src, dst, tolerance, excludes, is_url = result
         mode = self.mode_var.get()
         dry_run = self.dry_run_var.get()
 
-        # 只有镜像模式需要二次确认（会删除文件）
         if mode == "mirror" and not dry_run and not from_auto:
             if not messagebox.askyesno(
                 APP_TITLE,
@@ -1087,7 +1316,10 @@ class SyncApp:
         task_name = self.name_var.get() or "当前任务"
         self.msg_queue.put("=" * 60)
         self.msg_queue.put(f"任务      : {task_name}")
-        self.msg_queue.put(f"源文件夹  : {src}")
+        if is_url:
+            self.msg_queue.put(f"源仓库    : {src}")
+        else:
+            self.msg_queue.put(f"源文件夹  : {src}")
         self.msg_queue.put(f"目标文件夹: {dst}")
         self.msg_queue.put(f"同步模式  : {MODE_LONG.get(mode, mode)}"
                            + ("  （自动触发）" if from_auto else ""))
@@ -1101,7 +1333,6 @@ class SyncApp:
 
         ctx = Ctx(
             dry_run=dry_run,
-            # 只有镜像模式才删除；只复制永不删除
             delete=(mode == "mirror"),
             fast=self.fast_var.get(),
             tolerance=tolerance,
@@ -1113,17 +1344,16 @@ class SyncApp:
 
         self.worker = threading.Thread(
             target=self._run_sync,
-            args=(mode, src, dst, ctx, excluded),
+            args=(mode, src, dst, ctx, excluded, is_url),
             daemon=True,
         )
         self.worker.start()
         return True
 
     # ====================================================== 后台执行 ==
-    def _run_sync(self, mode: str, src: Path, dst: Path,
-                  ctx: Ctx, excluded) -> None:
-        start_time = time.time()
-        progress_state = {"t0": start_time}
+    def _run_sync(self, mode: str, src_arg, dst: Path,
+                  ctx: Ctx, excluded, is_url: bool) -> None:
+        progress_state = {"t0": time.time()}
 
         def progress_cb(done: int, total: int) -> None:
             if total <= 0:
@@ -1134,16 +1364,30 @@ class SyncApp:
             self.root.after(0, self._set_progress, done, total, eta)
 
         try:
+            # ---- Git 源：先更新本地缓存 ----
+            if is_url:
+                url = str(src_arg)
+                cache = git_cache_dir(url)
+                self.msg_queue.put(f"[GIT]    仓库缓存目录：{cache}")
+                ok, err = ensure_git_repo(url, cache, self.msg_queue.put)
+                if not ok:
+                    ctx.stats.errors += 1
+                    self.msg_queue.put(f"[ERROR]  {err}")
+                    return
+                actual_src = cache
+            else:
+                actual_src = Path(src_arg)
+
+            # ---- 构建计划 ----
             self.msg_queue.put("[准备]   正在扫描并比较文件…")
             t_plan = time.time()
 
             if mode == "two_way":
-                plan = plan_two_way(src, dst, ctx, excluded)
+                plan = plan_two_way(actual_src, dst, ctx, excluded)
             elif mode == "copy_only":
-                # 【修改】只复制现在是双向补齐
-                plan = plan_copy_only(src, dst, ctx, excluded)
+                plan = plan_copy_only(actual_src, dst, ctx, excluded)
             else:
-                plan = plan_mirror(src, dst, ctx, excluded)
+                plan = plan_mirror(actual_src, dst, ctx, excluded)
 
             plan_ms = (time.time() - t_plan) * 1000
 
@@ -1153,9 +1397,11 @@ class SyncApp:
                 f"{plan.skipped} 个相同，耗时 {plan_ms:.0f} ms"
             )
 
+            # ---- 执行 ----
             if plan.ops or plan.conflicts:
                 self.root.after(0, self.progress.configure,
                                 "maximum", max(plan.total_units, 1))
+                progress_state["t0"] = time.time()
                 execute_plan(plan, ctx, progress_cb)
             else:
                 self.root.after(0, self._set_progress, 0, 0, None)
@@ -1247,6 +1493,9 @@ class SyncApp:
         dst_text = self.dst_var.get().strip()
         if not src_text or not dst_text:
             return None
+        if is_git_url(src_text):
+            # Git 源无法本地探测远程改动，返回 None 让上层走定时拉取
+            return None
         try:
             a = Path(src_text).expanduser().resolve()
             b = Path(dst_text).expanduser().resolve()
@@ -1263,6 +1512,29 @@ class SyncApp:
         except Exception:
             return None
 
+    def _trigger_and_wait(self, reason: str) -> None:
+        """请主线程触发一次同步，并等待其结束。"""
+        self.msg_queue.put(f"[自动]   {reason}")
+        self.sync_done_event.clear()
+
+        def _trigger():
+            ok = self._start(from_auto=True)
+            if not ok:
+                self.sync_done_event.set()
+
+        self.root.after(0, _trigger)
+
+        t0 = time.time()
+        while not self.sync_done_event.is_set():
+            if self.monitor_stop:
+                break
+            if time.time() - t0 > 1800:  # 30 分钟上限
+                self.msg_queue.put("[自动]  同步超过 30 分钟，放弃本次等待")
+                break
+            time.sleep(0.3)
+
+        time.sleep(0.5)
+
     def _auto_sync_loop(self) -> None:
         last_sig: str | None = None
         last_tick = 0.0
@@ -1273,6 +1545,8 @@ class SyncApp:
                 self.monitor_reset = False
 
             interval = self._read_interval()
+            src_text = self.src_var.get().strip()
+            is_url = is_git_url(src_text)
 
             if self.worker and self.worker.is_alive():
                 time.sleep(0.4)
@@ -1284,6 +1558,16 @@ class SyncApp:
                 continue
             last_tick = now
 
+            # ---- Git 源：定时强制拉取并同步 ----
+            if is_url:
+                self.auto_status.set(f"Git 源：每 {interval:g} 秒拉取一次")
+                self._trigger_and_wait("定时拉取 Git 仓库并同步…")
+                if self.monitor_stop:
+                    break
+                self.auto_status.set("监控中…")
+                continue
+
+            # ---- 本地源：签名变化触发 ----
             sig = self._combined_signature()
             if sig is None:
                 self.auto_status.set("等待有效路径…")
@@ -1299,27 +1583,9 @@ class SyncApp:
             if sig != last_sig:
                 last_sig = sig
                 self.auto_status.set("检测到更改，触发同步")
-                self.msg_queue.put("[自动]   检测到文件夹变化，开始同步…")
-
-                self.sync_done_event.clear()
-
-                def _trigger():
-                    ok = self._start(from_auto=True)
-                    if not ok:
-                        self.sync_done_event.set()
-
-                self.root.after(0, _trigger)
-
-                t0 = time.time()
-                while not self.sync_done_event.is_set():
-                    if self.monitor_stop:
-                        break
-                    if time.time() - t0 > 1800:
-                        self.msg_queue.put("[自动]  同步超过 30 分钟，放弃本次等待")
-                        break
-                    time.sleep(0.3)
-
-                time.sleep(0.5)
+                self._trigger_and_wait("检测到文件夹变化，开始同步…")
+                if self.monitor_stop:
+                    break
                 last_sig = self._combined_signature()
                 self.auto_status.set("监控中…")
 
