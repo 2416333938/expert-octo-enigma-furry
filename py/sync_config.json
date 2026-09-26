@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "last_selected": 0,
+  "last_selected": 1,
   "window_geometry": "1120x780+409+193",
   "profiles": [
     {
@@ -16,6 +16,20 @@
       "excludes": "",
       "auto_sync": true,
       "auto_interval": "1"
+    },
+    {
+      "name": "编程",
+      "src": "D:/c++",
+      "dst": "F:/编程文件",
+      "mode": "one_way",
+      "dry_run": false,
+      "fast": false,
+      "clean_empty_dirs": true,
+      "conflict": "skip",
+      "tolerance": "2",
+      "excludes": "",
+      "auto_sync": false,
+      "auto_interval": "5"
     }
   ]
 }

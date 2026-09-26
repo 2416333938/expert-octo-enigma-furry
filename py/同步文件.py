@@ -6,8 +6,8 @@
 同步模式：
   - 单向增量：A → B，只补新增/更新的（内容或时间不同会覆盖）
   - 单向镜像：A → B，让 B 与 A 完全一致（B 中多余会被删除）
-  - 双向同步：A ↔ B，按修改时间互补
-  - 只复制  ：A → B，目标中不存在的才复制，同名一律跳过（绝不覆盖）
+  - 双向同步：A ↔ B，按修改时间互补（较新覆盖较旧）
+  - 只复制  ：A ↔ B，双向补齐缺失文件；同名一律跳过（不覆盖、不删除）
 
 仅依赖 Python 标准库（tkinter），无需 pip 安装。
 """
@@ -332,18 +332,33 @@ def plan_mirror(src: Path, dst: Path, ctx: "Ctx", excluded) -> Plan:
     return plan
 
 
-def plan_copy_only(src: Path, dst: Path, ctx: "Ctx", excluded) -> Plan:
+# 【修改】只复制：A ↔ B 双向补齐；同名一律跳过
+def plan_copy_only(a: Path, b: Path, ctx: "Ctx", excluded) -> Plan:
+    """
+    只复制（双向补齐）：
+      - A 有、B 没有 → 复制 A → B
+      - B 有、A 没有 → 复制 B → A
+      - A、B 都有（同名）→ 一律跳过，不比内容、不覆盖、不删除
+    """
     plan = Plan()
-    src_map = scan(src, excluded)
-    dst_map = scan(dst, excluded)
+    a_map = scan(a, excluded)
+    b_map = scan(b, excluded)
 
-    for rel in sorted(src_map):
+    # A → B：只复制 B 里不存在的
+    for rel in sorted(a_map):
         if ctx._stopped():
             return plan
-        if rel not in dst_map:
-            plan.ops.append(Op("copy", src / rel, dst / rel, "目标中不存在"))
+        if rel not in b_map:
+            plan.ops.append(Op("copy", a / rel, b / rel, "B 中不存在"))
         else:
             plan.skipped += 1
+
+    # B → A：只复制 A 里不存在的
+    for rel in sorted(b_map):
+        if ctx._stopped():
+            return plan
+        if rel not in a_map:
+            plan.ops.append(Op("copy", b / rel, a / rel, "A 中不存在"))
 
     return plan
 
@@ -499,11 +514,12 @@ def execute_plan(plan: Plan, ctx: Ctx, progress_callback=None) -> None:
 # =========================================================================== #
 
 MODE_SHORT = {"one_way": "增量", "mirror": "镜像", "two_way": "双向", "copy_only": "只复制"}
+# 【修改】只复制的长描述
 MODE_LONG = {
     "one_way": "单向增量",
     "mirror": "单向镜像",
-    "two_way": "双向同步",
-    "copy_only": "只复制（同名跳过）",
+    "two_way": "双向同步（较新覆盖较旧）",
+    "copy_only": "只复制（双向补齐，同名跳过，不删除、不覆盖）",
 }
 
 
@@ -525,7 +541,6 @@ class SyncApp:
         self.monitor_stop = True
         self.monitor_reset = False
         self.auto_busy = False
-        # 【修复】同步完成信号：监控线程用它等待本次同步真正结束
         self.sync_done_event = threading.Event()
         self.sync_done_event.set()
 
@@ -642,17 +657,18 @@ class SyncApp:
                         variable=self.mode_var, value="one_way").pack(anchor="w", padx=8, pady=2)
         ttk.Radiobutton(mf, text="单向镜像（A → B，B 中多余文件会被删除）",
                         variable=self.mode_var, value="mirror").pack(anchor="w", padx=8, pady=2)
-        ttk.Radiobutton(mf, text="双向同步（A ↔ B，按修改时间互补）",
+        ttk.Radiobutton(mf, text="双向同步（A ↔ B，较新覆盖较旧）",
                         variable=self.mode_var, value="two_way").pack(anchor="w", padx=8, pady=2)
 
+        # 【修改】只复制模式的描述
         copy_row = ttk.Frame(mf)
         copy_row.pack(anchor="w", padx=8, pady=2, fill="x")
         ttk.Radiobutton(
             copy_row,
-            text="只复制（A → B，目标中不存在的才复制，同名一律跳过，绝不覆盖）",
+            text="只复制（A ↔ B 双向补齐：把彼此缺失的文件复制给对方；同名一律跳过）",
             variable=self.mode_var, value="copy_only",
         ).pack(side="left")
-        ttk.Label(copy_row, text="  ← 最安全，不会覆盖任何已有文件",
+        ttk.Label(copy_row, text="  ← 不删除、不覆盖，最安全",
                   foreground="#1e8449").pack(side="left")
 
         # ================ 选项 ================
@@ -1024,7 +1040,6 @@ class SyncApp:
     def _start(self, from_auto: bool = False) -> bool:
         if self.worker and self.worker.is_alive():
             return False
-        # 【修复】不再用 auto_busy 拦截自动触发，避免自己拦住自己
 
         result = self._validate_inputs()
         if result is None:
@@ -1036,6 +1051,7 @@ class SyncApp:
         mode = self.mode_var.get()
         dry_run = self.dry_run_var.get()
 
+        # 只有镜像模式需要二次确认（会删除文件）
         if mode == "mirror" and not dry_run and not from_auto:
             if not messagebox.askyesno(
                 APP_TITLE,
@@ -1081,11 +1097,11 @@ class SyncApp:
             self.msg_queue.put(">>> 预览模式：不会修改任何文件 <<<")
         self.msg_queue.put("-" * 60)
 
-        # 【修复】开始前清掉完成信号，结束时由 _run_sync 置位
         self.sync_done_event.clear()
 
         ctx = Ctx(
             dry_run=dry_run,
+            # 只有镜像模式才删除；只复制永不删除
             delete=(mode == "mirror"),
             fast=self.fast_var.get(),
             tolerance=tolerance,
@@ -1124,6 +1140,7 @@ class SyncApp:
             if mode == "two_way":
                 plan = plan_two_way(src, dst, ctx, excluded)
             elif mode == "copy_only":
+                # 【修改】只复制现在是双向补齐
                 plan = plan_copy_only(src, dst, ctx, excluded)
             else:
                 plan = plan_mirror(src, dst, ctx, excluded)
@@ -1149,7 +1166,6 @@ class SyncApp:
             self.msg_queue.put(f"[ERROR]  同步异常：{exc}")
         finally:
             self.root.after(0, self._on_finish, ctx)
-            # 【修复】通知监控线程：本次同步已真正结束
             self.sync_done_event.set()
 
     # ====================================================== 进度显示 ==
@@ -1285,13 +1301,11 @@ class SyncApp:
                 self.auto_status.set("检测到更改，触发同步")
                 self.msg_queue.put("[自动]   检测到文件夹变化，开始同步…")
 
-                # 【修复】清除信号 → 请主线程启动同步 → 等待同步真正结束
                 self.sync_done_event.clear()
 
                 def _trigger():
                     ok = self._start(from_auto=True)
                     if not ok:
-                        # 参数无效 / 已有同步在跑 → 立即释放等待
                         self.sync_done_event.set()
 
                 self.root.after(0, _trigger)
@@ -1300,12 +1314,11 @@ class SyncApp:
                 while not self.sync_done_event.is_set():
                     if self.monitor_stop:
                         break
-                    if time.time() - t0 > 1800:   # 30 分钟上限
+                    if time.time() - t0 > 1800:
                         self.msg_queue.put("[自动]  同步超过 30 分钟，放弃本次等待")
                         break
                     time.sleep(0.3)
 
-                # 等文件系统时间戳稳定，再建立新基线
                 time.sleep(0.5)
                 last_sig = self._combined_signature()
                 self.auto_status.set("监控中…")
