@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-文件夹同步工具（GUI 版 · 多任务 · 支持“只复制” · 支持 Git 源）
+文件夹同步工具（GUI 版 · 多任务 · 只复制 · Git 源 · 系统托盘）
 
 同步模式：
-  - 单向增量：A → B，只补新增/更新的（内容或时间不同会覆盖）
-  - 单向镜像：A → B，让 B 与 A 完全一致（B 中多余会被删除）
-  - 双向同步：A ↔ B，按修改时间互补（较新覆盖较旧）
-  - 只复制  ：A ↔ B，双向补齐缺失文件；同名一律跳过（不覆盖、不删除）
+  - 单向增量：A → B，只补新增/更新的
+  - 单向镜像：A → B，B 与 A 完全一致（会删除多余）
+  - 双向同步：A ↔ B，按修改时间互补
+  - 只复制  ：A ↔ B 双向补齐，同名跳过（不覆盖、不删除）
 
 Git 源：
-  当“源”输入的是 Git 仓库地址（https://...、git@...、ssh://... 等）时，
-  程序会先把仓库拉取到本地缓存，再按所选模式同步到目标文件夹。
-  由于远程仓库不能直接被写回，此时只保留“单向增量 / 单向镜像”。
+  源输入 Git 仓库地址时，先拉取到本地缓存再同步；只保留单向增量 / 单向镜像。
 
-仅依赖 Python 标准库（tkinter），无需 pip 安装；
-Git 源功能需要系统已安装 git 并加入 PATH。
+系统托盘：
+  勾选“关闭窗口时最小化到系统托盘”后，点 X 会隐藏窗口到托盘。
+  托盘菜单：显示主窗口 / 立即同步 / 退出。
+  需要 pystray + Pillow：pip install pystray Pillow
+
+仅依赖 Python 标准库（tkinter）+ 可选的 pystray/Pillow（托盘功能）。
 """
 
 from __future__ import annotations
@@ -48,7 +50,6 @@ CONFIG_VERSION = 2
 # Git 支持
 # =========================================================================== #
 
-# 常见 Git URL 形式
 _GIT_URL_PATTERNS = [
     re.compile(r"^https?://.+\.git/?$", re.I),
     re.compile(r"^https?://(github\.com|gitlab\.com|gitee\.com|bitbucket\.org|codeberg\.org)/[\w.\-]+/[\w.\-]+/?$", re.I),
@@ -60,29 +61,22 @@ _GIT_URL_PATTERNS = [
 
 
 def is_git_url(s: str) -> bool:
-    """粗略判断字符串是否像 Git 仓库地址。"""
     s = (s or "").strip()
     if not s or " " in s:
         return False
-    # 排除 Windows 盘符路径 C:\xxx
     if re.match(r"^[A-Za-z]:[\\/]", s):
         return False
     return any(p.match(s) for p in _GIT_URL_PATTERNS)
 
 
 def run_git(args: list[str], cwd=None, timeout: int = 300):
-    """执行 git 命令。返回 (returncode, stdout, stderr)。"""
     kwargs = {}
     if os.name == "nt":
-        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        kwargs["creationflags"] = 0x08000000
     try:
         r = subprocess.run(
-            ["git"] + args,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            **kwargs,
+            ["git"] + args, cwd=cwd, capture_output=True, text=True,
+            timeout=timeout, **kwargs,
         )
         return r.returncode, r.stdout or "", r.stderr or ""
     except FileNotFoundError:
@@ -98,7 +92,6 @@ def git_available() -> bool:
 
 
 def git_cache_dir(url: str) -> Path:
-    """为 URL 生成一个稳定的缓存目录。"""
     h = hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
     name = url.rstrip("/").split("/")[-1].split(":")[-1]
     if name.endswith(".git"):
@@ -109,10 +102,8 @@ def git_cache_dir(url: str) -> Path:
 
 
 def ensure_git_repo(url: str, cache_dir: Path, log) -> tuple[bool, str]:
-    """保证缓存目录是最新仓库内容。返回 (成功, 错误)。"""
     cache_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    # 首次：clone
     if not (cache_dir / ".git").exists():
         if cache_dir.exists():
             try:
@@ -126,7 +117,6 @@ def ensure_git_repo(url: str, cache_dir: Path, log) -> tuple[bool, str]:
         log("[GIT]    克隆完成")
         return True, ""
 
-    # 已有缓存：pull
     log("[GIT]    拉取更新 …")
     rc, out, err = run_git(["-C", str(cache_dir), "pull", "--ff-only"], timeout=600)
     if rc != 0:
@@ -137,7 +127,6 @@ def ensure_git_repo(url: str, cache_dir: Path, log) -> tuple[bool, str]:
         if rc2 != 0:
             return False, f"git fetch 失败：{(err or out).strip()}"
 
-        # 依次尝试 origin/HEAD、origin/main、origin/master
         target = None
         rc3, out3, _e3 = run_git(
             ["-C", str(cache_dir), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
@@ -666,6 +655,15 @@ class SyncApp:
         self.sync_done_event = threading.Event()
         self.sync_done_event.set()
 
+        # ---------- 托盘 ----------
+        self.tray_icon = None                       # pystray.Icon 实例
+        self._allow_real_exit = False               # 托盘“退出”时置 True
+        self._tray_hint_shown = False
+        self.tray_enabled_var = tk.BooleanVar(
+            value=bool(cfg.get("tray_enabled", True))
+        )
+
+        # ---------- UI 变量 ----------
         self.name_var = tk.StringVar()
         self.src_var = tk.StringVar()
         self.dst_var = tk.StringVar()
@@ -684,7 +682,6 @@ class SyncApp:
         self.auto_status = tk.StringVar(value="未开启")
         self.git_hint_var = tk.StringVar(value="")
 
-        # 保存模式单选按钮引用，便于根据 Git 源启用/禁用
         self.mode_buttons: dict[str, ttk.Radiobutton] = {}
 
         self._build_ui()
@@ -694,12 +691,11 @@ class SyncApp:
             try:
                 root.geometry(geom)
             except tk.TclError:
-                root.geometry("1120x820")
+                root.geometry("1120x830")
         else:
-            root.geometry("1120x820")
+            root.geometry("1120x830")
         root.minsize(980, 700)
 
-        # 源输入变化时检测 Git 地址
         self.src_var.trace_add("write", self._on_src_var_changed)
 
         self._refresh_task_list()
@@ -771,7 +767,6 @@ class SyncApp:
         ttk.Button(pf, text="浏览…", command=lambda: self._pick_dir(self.src_var)) \
             .grid(row=0, column=2, padx=6)
 
-        # Git 提示
         ttk.Label(pf, textvariable=self.git_hint_var,
                   foreground="#8e44ad", wraplength=560, justify="left") \
             .grid(row=1, column=1, columnspan=2, sticky="w", padx=6, pady=(0, 4))
@@ -803,17 +798,13 @@ class SyncApp:
         rb.pack(anchor="w", padx=8, pady=2)
         self.mode_buttons["two_way"] = rb
 
-        copy_row = ttk.Frame(mf)
-        copy_row.pack(anchor="w", padx=8, pady=2, fill="x")
         rb = ttk.Radiobutton(
-            copy_row,
+            mf,
             text="只复制（A ↔ B 双向补齐：把彼此缺失的文件复制给对方；同名一律跳过）",
             variable=self.mode_var, value="copy_only",
         )
-        rb.pack(side="left")
+        rb.pack(anchor="w", padx=8, pady=2)
         self.mode_buttons["copy_only"] = rb
-        ttk.Label(copy_row, text="  ← 不删除、不覆盖，最安全",
-                  foreground="#1e8449").pack(side="left")
 
         # ================ 选项 ================
         of = ttk.LabelFrame(right, text="选项")
@@ -827,6 +818,9 @@ class SyncApp:
                         variable=self.fast_var).grid(row=1, column=0, sticky="w", pady=2)
         ttk.Checkbutton(oleft, text="删除文件后清理空目录",
                         variable=self.clean_empty_var).grid(row=2, column=0, sticky="w", pady=2)
+        # 【托盘】最小化到托盘
+        ttk.Checkbutton(oleft, text="关闭窗口时最小化到系统托盘",
+                        variable=self.tray_enabled_var).grid(row=3, column=0, sticky="w", pady=2)
 
         oright = ttk.Frame(of)
         oright.pack(side="left", fill="both", expand=True, padx=6, pady=6)
@@ -871,6 +865,9 @@ class SyncApp:
         ttk.Button(bf, text="保存设置", command=self._save_settings_clicked) \
             .pack(side="left", padx=6)
         ttk.Button(bf, text="清空日志", command=self._clear_log).pack(side="left", padx=6)
+        # 【托盘】托盘可用时提供“隐藏到托盘”按钮
+        ttk.Button(bf, text="隐藏到托盘", command=self._hide_to_tray) \
+            .pack(side="left", padx=6)
 
         self.progress = ttk.Progressbar(bf, mode="determinate",
                                         maximum=1, variable=self.progress_var)
@@ -897,6 +894,7 @@ class SyncApp:
         self.log_text.tag_configure("conflict", foreground="#b9770e")
         self.log_text.tag_configure("auto", foreground="#2471a3")
         self.log_text.tag_configure("git", foreground="#8e44ad")
+        self.log_text.tag_configure("tray", foreground="#16a085")
         self.log_text.tag_configure("info", foreground="#7f8c8d")
 
         ttk.Label(self.root, text=f"配置文件：{self.config_path}",
@@ -913,11 +911,9 @@ class SyncApp:
         self._update_git_mode_lock()
 
     def _update_git_mode_lock(self) -> None:
-        """根据源是否为 Git 地址，禁用/恢复相关模式按钮。"""
         src_text = self.src_var.get().strip()
         is_url = is_git_url(src_text)
 
-        # 双向 / 只复制在 Git 源下不可用
         for key in ("two_way", "copy_only"):
             btn = self.mode_buttons.get(key)
             if btn is not None:
@@ -941,6 +937,133 @@ class SyncApp:
                 self.mode_var.set("one_way")
         else:
             self.git_hint_var.set("")
+
+    # ====================================================== 托盘功能 ==
+    @staticmethod
+    def _pystray_available() -> bool:
+        try:
+            import pystray  # noqa: F401
+            from PIL import Image  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def _tray_should_enable(self) -> bool:
+        return bool(self.tray_enabled_var.get()) and self._pystray_available()
+
+    @staticmethod
+    def _make_tray_image():
+        """用 PIL 画一个简单的文件夹图标（无外部资源）。"""
+        from PIL import Image, ImageDraw
+        size = 64
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        # 文件夹主色
+        main = (41, 128, 185, 255)
+        # 文件夹标签（上半部分）
+        d.rounded_rectangle([6, 10, 30, 24], radius=3, fill=main)
+        # 文件夹主体
+        d.rounded_rectangle([6, 18, size - 6, size - 8], radius=5, fill=main)
+        return img
+
+    def _ensure_tray(self) -> bool:
+        """懒加载托盘图标。返回是否可用。"""
+        if self.tray_icon is not None:
+            return True
+        if not self._pystray_available():
+            return False
+        try:
+            import pystray
+        except ImportError:
+            return False
+
+        try:
+            image = self._make_tray_image()
+        except Exception:
+            return False
+
+        menu = pystray.Menu(
+            pystray.MenuItem("显示主窗口", self._tray_on_show, default=True),
+            pystray.MenuItem("立即同步", self._tray_on_sync),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("退出", self._tray_on_quit),
+        )
+        try:
+            icon = pystray.Icon("folder_sync", image, APP_TITLE, menu)
+            # 在后台线程运行托盘消息循环
+            threading.Thread(target=icon.run, daemon=True).start()
+            self.tray_icon = icon
+            self.msg_queue.put("[托盘]   已启动系统托盘图标")
+        except Exception as exc:
+            self.msg_queue.put(f"[托盘]  创建托盘图标失败：{exc}")
+            self.tray_icon = None
+            return False
+        return True
+
+    def _hide_to_tray(self) -> None:
+        """隐藏窗口到托盘。"""
+        if not self.tray_enabled_var.get():
+            # 用户没开启托盘 → 直接忽略，不做任何隐藏
+            self.msg_queue.put("[托盘]  未开启“关闭时最小化到托盘”，无法隐藏")
+            return
+        if not self._ensure_tray():
+            messagebox.showwarning(
+                APP_TITLE,
+                "未安装 pystray / Pillow，无法使用系统托盘。\n\n"
+                "请执行：pip install pystray Pillow"
+            )
+            return
+
+        self._save_settings()
+        self.root.withdraw()
+
+        # 首次隐藏时，弹一次气泡提示
+        if not self._tray_hint_shown and self.tray_icon is not None:
+            self._tray_hint_shown = True
+            try:
+                self.tray_icon.notify(
+                    "程序已最小化到托盘。双击图标可恢复窗口。", APP_TITLE
+                )
+            except Exception:
+                pass
+
+        self.msg_queue.put("[托盘]   窗口已隐藏到系统托盘")
+
+    def _restore_window(self) -> None:
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    # ---- 托盘菜单回调（在托盘线程里执行，需切回主线程） ----
+    def _tray_on_show(self, icon=None, item=None) -> None:
+        self.root.after(0, self._restore_window)
+
+    def _tray_on_sync(self, icon=None, item=None) -> None:
+        def _do():
+            self._restore_window()
+            if self.worker and self.worker.is_alive():
+                self.msg_queue.put("[托盘]   已有同步在运行，忽略本次请求")
+                return
+            self._start(from_auto=False)
+        self.root.after(0, _do)
+
+    def _tray_on_quit(self, icon=None, item=None) -> None:
+        self._allow_real_exit = True
+        self.root.after(0, self._on_close)
+
+    def _stop_tray(self) -> None:
+        icon = self.tray_icon
+        self.tray_icon = None
+        if icon is None:
+            return
+        try:
+            icon.stop()
+        except Exception:
+            pass
 
     # ====================================================== 任务列表操作 ==
     def _refresh_task_list(self) -> None:
@@ -1121,7 +1244,6 @@ class SyncApp:
             self.auto_interval_var.set(p.get("auto_interval", "5"))
         finally:
             self._suppress_src_check = False
-        # 根据新的 src 更新模式可用性
         self._update_git_mode_lock()
 
     def _save_ui_to_profile(self, idx: int) -> None:
@@ -1151,6 +1273,7 @@ class SyncApp:
             "version": CONFIG_VERSION,
             "last_selected": self.current_index if self.current_index is not None else 0,
             "window_geometry": geom,
+            "tray_enabled": bool(self.tray_enabled_var.get()),
             "profiles": self.profiles,
         }
 
@@ -1193,6 +1316,8 @@ class SyncApp:
             tag = "auto"
         elif "[GIT]" in text:
             tag = "git"
+        elif "[托盘]" in text:
+            tag = "tray"
         elif "[信息]" in text or "[准备]" in text:
             tag = "info"
         self.log_text.insert("end", text + "\n", tag or ())
@@ -1209,10 +1334,6 @@ class SyncApp:
 
     # ====================================================== 校验 ==
     def _validate_inputs(self):
-        """
-        返回 (src, dst, tolerance, excludes, is_url) 或 None。
-        src 为 Git 地址时是 str，本地时是 Path。
-        """
         src_text = self.src_var.get().strip()
         dst_text = self.dst_var.get().strip()
         if not src_text:
@@ -1232,7 +1353,6 @@ class SyncApp:
                     "请安装 Git 并确保它在 PATH 中。"
                 )
                 return None
-            # 若当前模式是双向或只复制，强制改回单向增量
             if self.mode_var.get() in ("two_way", "copy_only"):
                 self.mode_var.set("one_way")
             src = src_text
@@ -1364,7 +1484,6 @@ class SyncApp:
             self.root.after(0, self._set_progress, done, total, eta)
 
         try:
-            # ---- Git 源：先更新本地缓存 ----
             if is_url:
                 url = str(src_arg)
                 cache = git_cache_dir(url)
@@ -1378,7 +1497,6 @@ class SyncApp:
             else:
                 actual_src = Path(src_arg)
 
-            # ---- 构建计划 ----
             self.msg_queue.put("[准备]   正在扫描并比较文件…")
             t_plan = time.time()
 
@@ -1397,7 +1515,6 @@ class SyncApp:
                 f"{plan.skipped} 个相同，耗时 {plan_ms:.0f} ms"
             )
 
-            # ---- 执行 ----
             if plan.ops or plan.conflicts:
                 self.root.after(0, self.progress.configure,
                                 "maximum", max(plan.total_units, 1))
@@ -1451,6 +1568,20 @@ class SyncApp:
         self.status_var.set("完成" if s.errors == 0 else f"完成（{s.errors} 个错误）")
         self.progress_label.set("已完成")
 
+        # 托盘气泡：仅在窗口隐藏时提示
+        if self.tray_icon is not None and not self.root.winfo_viewable():
+            try:
+                if s.errors:
+                    self.tray_icon.notify(
+                        f"同步完成，{s.errors} 个操作失败", APP_TITLE
+                    )
+                else:
+                    self.tray_icon.notify(
+                        f"同步完成：复制 {s.copied}，删除 {s.deleted}", APP_TITLE
+                    )
+            except Exception:
+                pass
+
     def _stop(self) -> None:
         if self.worker and self.worker.is_alive():
             self.stop_requested = True
@@ -1494,7 +1625,6 @@ class SyncApp:
         if not src_text or not dst_text:
             return None
         if is_git_url(src_text):
-            # Git 源无法本地探测远程改动，返回 None 让上层走定时拉取
             return None
         try:
             a = Path(src_text).expanduser().resolve()
@@ -1513,7 +1643,6 @@ class SyncApp:
             return None
 
     def _trigger_and_wait(self, reason: str) -> None:
-        """请主线程触发一次同步，并等待其结束。"""
         self.msg_queue.put(f"[自动]   {reason}")
         self.sync_done_event.clear()
 
@@ -1528,7 +1657,7 @@ class SyncApp:
         while not self.sync_done_event.is_set():
             if self.monitor_stop:
                 break
-            if time.time() - t0 > 1800:  # 30 分钟上限
+            if time.time() - t0 > 1800:
                 self.msg_queue.put("[自动]  同步超过 30 分钟，放弃本次等待")
                 break
             time.sleep(0.3)
@@ -1558,7 +1687,6 @@ class SyncApp:
                 continue
             last_tick = now
 
-            # ---- Git 源：定时强制拉取并同步 ----
             if is_url:
                 self.auto_status.set(f"Git 源：每 {interval:g} 秒拉取一次")
                 self._trigger_and_wait("定时拉取 Git 仓库并同步…")
@@ -1567,7 +1695,6 @@ class SyncApp:
                 self.auto_status.set("监控中…")
                 continue
 
-            # ---- 本地源：签名变化触发 ----
             sig = self._combined_signature()
             if sig is None:
                 self.auto_status.set("等待有效路径…")
@@ -1595,9 +1722,17 @@ class SyncApp:
 
     # ====================================================== 关闭 ==
     def _on_close(self) -> None:
+        # 托盘可用 + 开关打开 + 不是托盘“退出”菜单 → 隐藏到托盘
+        if self._tray_should_enable() and not self._allow_real_exit:
+            self._save_settings()
+            self._hide_to_tray()
+            return
+
+        # 真正退出
         self._save_settings()
         self.monitor_stop = True
         self.stop_requested = True
+        self._stop_tray()
         self.root.after(150, self.root.destroy)
 
 
