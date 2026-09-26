@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-文件夹同步工具（GUI 版 · 多任务）
+文件夹同步工具（GUI 版 · 多任务 · 支持“只复制”模式）
 
-新增：
-  - 左侧任务列表，可管理多个同步任务（新建/复制/删除/重命名）
-  - 每个任务独立保存源、目标、模式、排除规则、自动同步等设置
-  - 切换任务自动保存，重启后恢复上次选中任务
-  - 配置文件：程序所在目录的 sync_config.json（多任务结构）
+同步模式：
+  - 单向增量：A → B，只补新增/更新的（内容或时间不同会覆盖）
+  - 单向镜像：A → B，让 B 与 A 完全一致（B 中多余会被删除）
+  - 双向同步：A ↔ B，按修改时间互补
+  - 只复制  ：A → B，目标中不存在的才复制，同名一律跳过（绝不覆盖）
 
 仅依赖 Python 标准库（tkinter），无需 pip 安装。
 """
@@ -75,6 +75,9 @@ def save_config(data: dict) -> None:
 # 任务配置：默认值 / 规范化
 # --------------------------------------------------------------------------- #
 
+VALID_MODES = ("one_way", "mirror", "two_way", "copy_only")
+
+
 def default_profile(name: str = "新任务") -> dict:
     return {
         "name": name,
@@ -113,7 +116,6 @@ def _as_float_str(v, default: str, min_value: float = 0.0) -> str:
 
 
 def normalize_profile(raw: dict, fallback_name: str = "未命名任务") -> dict:
-    """把任意 dict 规范化为完整的 profile。"""
     p = default_profile()
     if not isinstance(raw, dict):
         return p
@@ -123,7 +125,7 @@ def normalize_profile(raw: dict, fallback_name: str = "未命名任务") -> dict
     p["dst"] = str(raw.get("dst", "") or "")
 
     mode = raw.get("mode", "one_way")
-    if mode not in ("one_way", "mirror", "two_way"):
+    if mode not in VALID_MODES:
         mode = "one_way"
     p["mode"] = mode
 
@@ -146,7 +148,6 @@ def normalize_profile(raw: dict, fallback_name: str = "未命名任务") -> dict
 
 
 def normalize_config(cfg: dict) -> tuple[list[dict], int]:
-    """返回 (profiles, last_selected)。兼容旧版单任务配置。"""
     profiles_raw = cfg.get("profiles")
     profiles: list[dict] = []
 
@@ -156,7 +157,6 @@ def normalize_config(cfg: dict) -> tuple[list[dict], int]:
                 profiles.append(normalize_profile(item, f"任务 {i + 1}"))
 
     if not profiles and ("src" in cfg or "dst" in cfg):
-        # 从旧格式迁移
         profiles = [normalize_profile(cfg, "默认任务")]
 
     if not profiles:
@@ -332,6 +332,22 @@ def plan_mirror(src: Path, dst: Path, ctx: "Ctx", excluded) -> Plan:
     return plan
 
 
+def plan_copy_only(src: Path, dst: Path, ctx: "Ctx", excluded) -> Plan:
+    plan = Plan()
+    src_map = scan(src, excluded)
+    dst_map = scan(dst, excluded)
+
+    for rel in sorted(src_map):
+        if ctx._stopped():
+            return plan
+        if rel not in dst_map:
+            plan.ops.append(Op("copy", src / rel, dst / rel, "目标中不存在"))
+        else:
+            plan.skipped += 1
+
+    return plan
+
+
 def plan_two_way(a: Path, b: Path, ctx: "Ctx", excluded) -> Plan:
     plan = Plan()
     a_map = scan(a, excluded)
@@ -482,8 +498,13 @@ def execute_plan(plan: Plan, ctx: Ctx, progress_callback=None) -> None:
 # GUI
 # =========================================================================== #
 
-MODE_SHORT = {"one_way": "增量", "mirror": "镜像", "two_way": "双向"}
-MODE_LONG = {"one_way": "单向增量", "mirror": "单向镜像", "two_way": "双向同步"}
+MODE_SHORT = {"one_way": "增量", "mirror": "镜像", "two_way": "双向", "copy_only": "只复制"}
+MODE_LONG = {
+    "one_way": "单向增量",
+    "mirror": "单向镜像",
+    "two_way": "双向同步",
+    "copy_only": "只复制（同名跳过）",
+}
 
 
 class SyncApp:
@@ -495,7 +516,6 @@ class SyncApp:
         cfg = load_config()
         self.profiles, last_selected = normalize_config(cfg)
 
-        # ---- 运行时状态 ----
         self.current_index: int | None = None
         self._suppress_select = False
         self.msg_queue: queue.Queue[str] = queue.Queue()
@@ -505,8 +525,10 @@ class SyncApp:
         self.monitor_stop = True
         self.monitor_reset = False
         self.auto_busy = False
+        # 【修复】同步完成信号：监控线程用它等待本次同步真正结束
+        self.sync_done_event = threading.Event()
+        self.sync_done_event.set()
 
-        # ---- UI 变量（先创建，后面再填充） ----
         self.name_var = tk.StringVar()
         self.src_var = tk.StringVar()
         self.dst_var = tk.StringVar()
@@ -526,16 +548,15 @@ class SyncApp:
 
         self._build_ui()
 
-        # 窗口几何
         geom = cfg.get("window_geometry")
         if isinstance(geom, str) and geom.strip():
             try:
                 root.geometry(geom)
             except tk.TclError:
-                root.geometry("1120x780")
+                root.geometry("1120x800")
         else:
-            root.geometry("1120x780")
-        root.minsize(980, 660)
+            root.geometry("1120x800")
+        root.minsize(980, 680)
 
         self._refresh_task_list()
         self._select_task(last_selected, force=True)
@@ -547,11 +568,10 @@ class SyncApp:
     def _build_ui(self) -> None:
         pad = {"padx": 8, "pady": 6}
 
-        # 主体：左右分栏
         paned = ttk.PanedWindow(self.root, orient="horizontal")
         paned.pack(fill="both", expand=True, **pad)
 
-        # =========================== 左侧：任务列表 ===========================
+        # ================ 左侧：任务列表 ================
         left = ttk.Frame(paned)
         paned.add(left, weight=0)
 
@@ -567,7 +587,7 @@ class SyncApp:
         self.task_tree.heading("#0", text="任务名")
         self.task_tree.heading("mode", text="模式")
         self.task_tree.column("#0", width=170, stretch=True, minwidth=120)
-        self.task_tree.column("mode", width=60, anchor="center", stretch=False)
+        self.task_tree.column("mode", width=68, anchor="center", stretch=False)
 
         tsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.task_tree.yview)
         self.task_tree.configure(yscrollcommand=tsb.set)
@@ -586,11 +606,10 @@ class SyncApp:
         self.task_tree.bind("<<TreeviewSelect>>", self._on_task_select)
         self.task_tree.bind("<Double-1>", lambda e: self._rename_task())
 
-        # =========================== 右侧：详情 ===========================
+        # ================ 右侧：详情 ================
         right = ttk.Frame(paned)
         paned.add(right, weight=1)
 
-        # 任务名称
         nf = ttk.LabelFrame(right, text="任务")
         nf.pack(fill="x", padx=4, pady=(0, 4))
         nf.columnconfigure(1, weight=1)
@@ -598,7 +617,6 @@ class SyncApp:
         ttk.Entry(nf, textvariable=self.name_var).grid(row=0, column=1, sticky="ew",
                                                        padx=(0, 6), pady=6)
 
-        # 文件夹
         pf = ttk.LabelFrame(right, text="文件夹")
         pf.pack(fill="x", padx=4, pady=4)
         pf.columnconfigure(1, weight=1)
@@ -616,9 +634,10 @@ class SyncApp:
         ttk.Button(pf, text="A、B 互换", command=self._swap) \
             .grid(row=2, column=2, sticky="e", padx=6, pady=(0, 6))
 
-        # 模式
+        # ================ 同步模式 ================
         mf = ttk.LabelFrame(right, text="同步模式")
         mf.pack(fill="x", padx=4, pady=4)
+
         ttk.Radiobutton(mf, text="单向增量（A → B，只补新增/更新）",
                         variable=self.mode_var, value="one_way").pack(anchor="w", padx=8, pady=2)
         ttk.Radiobutton(mf, text="单向镜像（A → B，B 中多余文件会被删除）",
@@ -626,7 +645,17 @@ class SyncApp:
         ttk.Radiobutton(mf, text="双向同步（A ↔ B，按修改时间互补）",
                         variable=self.mode_var, value="two_way").pack(anchor="w", padx=8, pady=2)
 
-        # 选项
+        copy_row = ttk.Frame(mf)
+        copy_row.pack(anchor="w", padx=8, pady=2, fill="x")
+        ttk.Radiobutton(
+            copy_row,
+            text="只复制（A → B，目标中不存在的才复制，同名一律跳过，绝不覆盖）",
+            variable=self.mode_var, value="copy_only",
+        ).pack(side="left")
+        ttk.Label(copy_row, text="  ← 最安全，不会覆盖任何已有文件",
+                  foreground="#1e8449").pack(side="left")
+
+        # ================ 选项 ================
         of = ttk.LabelFrame(right, text="选项")
         of.pack(fill="x", padx=4, pady=4)
 
@@ -659,7 +688,7 @@ class SyncApp:
         ttk.Label(oright, text="（空格分隔，glob 语法：*.tmp  .git  __pycache__）",
                   foreground="#666").pack(anchor="w")
 
-        # 自动同步
+        # ================ 自动同步 ================
         af = ttk.LabelFrame(right, text="自动同步（仅对当前任务生效）")
         af.pack(fill="x", padx=4, pady=4)
         arow = ttk.Frame(af); arow.pack(fill="x", padx=8, pady=6)
@@ -671,7 +700,7 @@ class SyncApp:
         ttk.Label(arow, textvariable=self.auto_status,
                   foreground="#555").pack(side="left", padx=12)
 
-        # =========================== 底部：按钮 + 进度 ===========================
+        # ================ 底部按钮 ================
         bf = ttk.Frame(self.root)
         bf.pack(fill="x", **pad)
 
@@ -692,7 +721,7 @@ class SyncApp:
         ttk.Label(pfl, textvariable=self.progress_label,
                   anchor="w", foreground="#333").pack(side="left")
 
-        # =========================== 日志 ===========================
+        # ================ 日志 ================
         lf = ttk.LabelFrame(self.root, text="日志")
         lf.pack(fill="both", expand=True, **pad)
 
@@ -718,7 +747,6 @@ class SyncApp:
 
     # ====================================================== 任务列表操作 ==
     def _refresh_task_list(self) -> None:
-        """重建左侧 Treeview。"""
         self.task_tree.delete(*self.task_tree.get_children())
         for i, p in enumerate(self.profiles):
             name = p.get("name") or f"任务 {i + 1}"
@@ -731,7 +759,6 @@ class SyncApp:
             )
 
     def _refresh_task_item(self, idx: int) -> None:
-        """只更新一项（改名 / 改模式 / 改自动同步时用）。"""
         if not self.task_tree.exists(str(idx)):
             return
         p = self.profiles[idx]
@@ -762,7 +789,6 @@ class SyncApp:
         if not force and idx == self.current_index:
             return
 
-        # 保存旧任务
         if self.current_index is not None:
             self._save_ui_to_profile(self.current_index)
             self._refresh_task_item(self.current_index)
@@ -778,7 +804,6 @@ class SyncApp:
         finally:
             self._suppress_select = False
 
-        # 切换任务后重建自动同步基线
         self.monitor_reset = True
         p = self.profiles[idx]
         if p.get("auto_sync"):
@@ -860,7 +885,7 @@ class SyncApp:
         self.current_index = None
         new_idx = min(self.current_index or 0, len(self.profiles) - 1)
         self._refresh_task_list()
-        self._select_task(new_idx, force=True)
+        self._select_task(max(0, new_idx), force=True)
         self._save_settings()
 
     # ====================================================== Profile <-> UI ==
@@ -954,13 +979,6 @@ class SyncApp:
     def _poll_queue(self) -> None:
         try:
             while True:
-                self.msg_queue.get_nowait()
-                # 上一行只是占位，下面才是真正的日志写入
-        except queue.Empty:
-            pass
-        # 上面写法有 bug，改用正常方式
-        try:
-            while True:
                 msg = self.msg_queue.get_nowait()
                 self._append_log(msg)
         except queue.Empty:
@@ -1006,8 +1024,7 @@ class SyncApp:
     def _start(self, from_auto: bool = False) -> bool:
         if self.worker and self.worker.is_alive():
             return False
-        if from_auto and self.auto_busy:
-            return False
+        # 【修复】不再用 auto_busy 拦截自动触发，避免自己拦住自己
 
         result = self._validate_inputs()
         if result is None:
@@ -1037,7 +1054,6 @@ class SyncApp:
                         messagebox.showerror(APP_TITLE, f"无法创建目标文件夹：{exc}")
                     return False
 
-        # 保存设置（含当前任务）
         self._save_settings()
         if self.current_index is not None:
             self._refresh_task_item(self.current_index)
@@ -1064,6 +1080,9 @@ class SyncApp:
         if dry_run:
             self.msg_queue.put(">>> 预览模式：不会修改任何文件 <<<")
         self.msg_queue.put("-" * 60)
+
+        # 【修复】开始前清掉完成信号，结束时由 _run_sync 置位
+        self.sync_done_event.clear()
 
         ctx = Ctx(
             dry_run=dry_run,
@@ -1101,10 +1120,14 @@ class SyncApp:
         try:
             self.msg_queue.put("[准备]   正在扫描并比较文件…")
             t_plan = time.time()
+
             if mode == "two_way":
                 plan = plan_two_way(src, dst, ctx, excluded)
+            elif mode == "copy_only":
+                plan = plan_copy_only(src, dst, ctx, excluded)
             else:
                 plan = plan_mirror(src, dst, ctx, excluded)
+
             plan_ms = (time.time() - t_plan) * 1000
 
             self.msg_queue.put(
@@ -1126,6 +1149,8 @@ class SyncApp:
             self.msg_queue.put(f"[ERROR]  同步异常：{exc}")
         finally:
             self.root.after(0, self._on_finish, ctx)
+            # 【修复】通知监控线程：本次同步已真正结束
+            self.sync_done_event.set()
 
     # ====================================================== 进度显示 ==
     def _set_progress(self, done: int, total: int, eta: float | None) -> None:
@@ -1260,18 +1285,27 @@ class SyncApp:
                 self.auto_status.set("检测到更改，触发同步")
                 self.msg_queue.put("[自动]   检测到文件夹变化，开始同步…")
 
-                self.auto_busy = True
-                try:
-                    self.root.after(0, lambda: self._start(from_auto=True))
-                    t0 = time.time()
-                    while (self.worker and self.worker.is_alive()) or \
-                          (time.time() - t0 < 0.6):
-                        if self.monitor_stop:
-                            break
-                        time.sleep(0.3)
-                finally:
-                    self.auto_busy = False
+                # 【修复】清除信号 → 请主线程启动同步 → 等待同步真正结束
+                self.sync_done_event.clear()
 
+                def _trigger():
+                    ok = self._start(from_auto=True)
+                    if not ok:
+                        # 参数无效 / 已有同步在跑 → 立即释放等待
+                        self.sync_done_event.set()
+
+                self.root.after(0, _trigger)
+
+                t0 = time.time()
+                while not self.sync_done_event.is_set():
+                    if self.monitor_stop:
+                        break
+                    if time.time() - t0 > 1800:   # 30 分钟上限
+                        self.msg_queue.put("[自动]  同步超过 30 分钟，放弃本次等待")
+                        break
+                    time.sleep(0.3)
+
+                # 等文件系统时间戳稳定，再建立新基线
                 time.sleep(0.5)
                 last_sig = self._combined_signature()
                 self.auto_status.set("监控中…")
