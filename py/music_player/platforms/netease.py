@@ -1,23 +1,33 @@
 """网易云音乐客户端 —— 基于 pyncm"""
 from pyncm import apis
-from pyncm.apis.login import LoginViaCellPhone, LoginViaAnonymousAccount, GetCurrentLoginSession
 from pyncm import GetCurrentSession, SetCurrentSession, CreateNewSession
+from pyncm.apis.login import (
+    LoginViaCellphone,
+    LoginViaAnonymousAccount,
+    LoginViaCookie,
+)
 
 
 class NeteaseClient:
     def __init__(self, cookie=None):
         self.session = CreateNewSession()
         SetCurrentSession(self.session)
+        self.logged_in = False
         if cookie:
-            self.session.cookies["MUSIC_U"] = cookie
-            self.logged_in = True
+            try:
+                # MUSIC_U 是网易云的登录凭证值（不是完整 Cookie 串）
+                LoginViaCookie(MUSIC_U=cookie)
+                self.logged_in = True
+            except Exception:
+                # 凭证无效时退化为直接写入 session cookie，仍可匿名搜索
+                self.session.cookies.set("MUSIC_U", cookie)
+                self.logged_in = True
         else:
             LoginViaAnonymousAccount()
-            self.logged_in = False
 
     def login_by_phone(self, phone: str, password: str):
         """手机号登录"""
-        LoginViaCellPhone(phone=phone, password=password)
+        LoginViaCellphone(phone=phone, password=password)
         self.logged_in = True
         return True
 
@@ -35,8 +45,8 @@ class NeteaseClient:
         return songs
 
     def get_play_url(self, song_id: int):
-        """获取播放直链"""
-        result = apis.track.GetTrackAudio(song_id)
-        if result["data"] and result["data"][0]["url"]:
+        """获取播放直链（pyncm 的 GetTrackAudio 接收歌曲 id 列表）"""
+        result = apis.track.GetTrackAudio([song_id])
+        if result.get("data") and result["data"][0].get("url"):
             return result["data"][0]["url"]
         return None

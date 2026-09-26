@@ -11,7 +11,13 @@ import requests
 
 class MusicPlayer:
     def __init__(self):
-        pygame.mixer.init()
+        self._mixer_ok = True
+        try:
+            pygame.mixer.init()
+        except Exception as e:
+            # 无音频设备时不让程序崩溃，播放时再提示
+            self._mixer_ok = False
+            print(f"[播放器] 音频设备初始化失败: {e}")
         self._playing = False
         self._temp_files = []          # 所有生成的临时文件
         self._lock = threading.Lock()
@@ -58,6 +64,8 @@ class MusicPlayer:
     # ---------------- 内部实现 ----------------
     def _download_and_play(self, url, on_state_change):
         try:
+            if not self._mixer_ok:
+                raise RuntimeError("音频设备不可用，无法播放")
             if on_state_change:
                 on_state_change("downloading")
 

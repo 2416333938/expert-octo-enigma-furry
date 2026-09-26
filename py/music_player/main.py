@@ -14,6 +14,7 @@ class MusicApp:
         self.cfg = load_config()
         self.player = MusicPlayer()
         self.clients = {}
+        self.last_results = {}        # 保存最近一次搜索结果，供 play 命令使用
         self._init_clients()
 
     def _init_clients(self):
@@ -81,6 +82,7 @@ class MusicApp:
         except Exception as e:
             print(f"【汽水音乐】搜索失败: {e}")
 
+        self.last_results = results
         return results
 
     def search_bilibili(self, keyword: str, limit: int = 5):
@@ -92,6 +94,7 @@ class MusicApp:
             )
             for i, v in enumerate(videos):
                 print(f"  {i}. {v['title']}  UP: {v['author']}  [{v['bvid']}]")
+            self.last_results["bilibili"] = videos
             return videos
         except Exception as e:
             print(f"B站搜索失败: {e}")
@@ -111,6 +114,46 @@ class MusicApp:
         except Exception as e:
             print(f"播放失败: {e}")
 
+    def play_index(self, platform: str, index: int):
+        """播放搜索结果中的某一项"""
+        songs = self.last_results.get(platform)
+        if not songs:
+            print("请先搜索该平台（search / bili）")
+            return
+        if index < 0 or index >= len(songs):
+            print("索引超出范围")
+            return
+
+        item = songs[index]
+        client = self.clients.get(platform)
+        if client is None:
+            print(f"平台 {platform} 不可用")
+            return
+
+        try:
+            if platform == "netease":
+                url = client.get_play_url(item["id"])
+            elif platform == "qqmusic":
+                url = asyncio.run(client.get_play_url(item["mid"]))
+            elif platform == "kugou":
+                url = client.get_play_url(item["hash"], item.get("album_id"))
+            elif platform == "qishui":
+                url = client.get_play_url(item["id"])
+            elif platform == "bilibili":
+                url = asyncio.run(client.get_audio_url(item["bvid"]))
+            else:
+                print("未知平台")
+                return
+
+            title = item.get("name") or item.get("title") or "未知"
+            if url:
+                print(f"▶ 正在播放: {title}")
+                self.player.play_url(url)
+            else:
+                print(f"❌ 无法获取播放地址: {title}")
+        except Exception as e:
+            print(f"播放失败: {e}")
+
 
 def main():
     app = MusicApp()
@@ -120,12 +163,12 @@ def main():
 
     while True:
         print("\n命令:")
-        print("  search <关键词>        —— 跨平台搜索音乐")
-        print("  bili <关键词>          —— 搜索 B 站视频")
-        print("  playbili <bvid>        —— 播放 B 站视频音频")
-        print("  play <平台> <索引>     —— 播放搜索结果")
-        print("  login                  —— 配置登录信息")
-        print("  quit                   —— 退出")
+        print("  search <关键词>          —— 跨平台搜索音乐")
+        print("  bili <关键词>            —— 搜索 B 站视频")
+        print("  play <平台> <索引>       —— 播放搜索结果（如 play netease 0）")
+        print("  playbili <bvid>          —— 播放 B 站视频音频")
+        print("  login                    —— 配置登录信息")
+        print("  quit                     —— 退出")
 
         cmd = input("\n> ").strip()
         if not cmd:
@@ -134,6 +177,7 @@ def main():
             break
         if cmd == "login":
             configure_login(app.cfg)
+            app._init_clients()
             continue
 
         parts = cmd.split(maxsplit=2)
@@ -143,6 +187,11 @@ def main():
             app.search_bilibili(parts[1])
         elif parts[0] == "playbili" and len(parts) > 1:
             app.play_bilibili(parts[1])
+        elif parts[0] == "play" and len(parts) >= 3:
+            try:
+                app.play_index(parts[1].lower(), int(parts[2]))
+            except ValueError:
+                print("索引必须是数字，例如 play netease 0")
 
 
 def configure_login(cfg):
@@ -152,10 +201,13 @@ def configure_login(cfg):
     if platform == "bilibili":
         cfg["bilibili"]["sessdata"] = input("SESSDATA: ").strip()
         cfg["bilibili"]["bili_jct"] = input("bili_jct: ").strip()
+    elif platform == "netease":
+        # 网易云保存的是 MUSIC_U 值本身
+        cfg["netease"]["cookie"] = input("MUSIC_U 值: ").strip().replace("MUSIC_U=", "")
     elif platform in cfg:
         cfg[platform]["cookie"] = input("Cookie: ").strip()
     save_config(cfg)
-    print("✅ 已保存，重启程序生效")
+    print("✅ 已保存，客户端已刷新")
 
 
 if __name__ == "__main__":

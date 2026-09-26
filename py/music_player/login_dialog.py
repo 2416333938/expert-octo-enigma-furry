@@ -1,6 +1,7 @@
 """GUI 登录对话框 —— 支持二维码 / 手机号 / Cookie 三种登录方式"""
 import asyncio
 import io
+import json
 import threading
 import time
 import tkinter as tk
@@ -183,7 +184,7 @@ class LoginDialog(tk.Toplevel):
         from pyncm import apis, GetCurrentSession
         w = self.pages["netease"]
 
-        resp = apis.login.GetLoginQRCode()
+        resp = apis.login.LoginQrcodeUnikey()
         unikey = resp.get("unikey")
         if not unikey:
             raise RuntimeError(f"获取 unikey 失败：{resp}")
@@ -195,7 +196,7 @@ class LoginDialog(tk.Toplevel):
         start = time.time()
         while self._polling and time.time() - start < 300:
             try:
-                r = apis.login.CheckLoginQRCode(unikey)
+                r = apis.login.LoginQrcodeCheck(unikey)
             except Exception:
                 time.sleep(2)
                 continue
@@ -214,7 +215,7 @@ class LoginDialog(tk.Toplevel):
                 if not music_u:
                     self._ui(lambda: w["status_var"].set("❌ 登录成功但未拿到 Cookie"))
                     return
-                self._save_cookie("netease", f"MUSIC_U={music_u}")
+                self._save_cookie("netease", music_u)
                 self._ui(lambda: w["status_var"].set("✅ 网易云登录成功"))
                 self._ui(lambda: self._on_login_ok("netease"))
                 return
@@ -226,37 +227,30 @@ class LoginDialog(tk.Toplevel):
 
         async def flow():
             from qqmusic_api import Client
-            async with Client() as client:
-                qr = await client.login.get_qr_code()
-                url = qr.get("qrcode_url") or qr.get("url") or qr.get("qrcode")
-                identifier = qr.get("identifier") or qr.get("qr_id") or qr.get("id")
-                if not url:
-                    raise RuntimeError(f"获取二维码失败：{qr}")
+            from qqmusic_api.models.login import QRLoginType, QRCodeLoginEvents
 
-                self._show_qr("qqmusic", url)
+            async with Client() as client:
+                qr = await client.login.get_qrcode(QRLoginType.QQ)
+                if not qr.data:
+                    raise RuntimeError("获取二维码失败")
+
+                self._show_qr_bytes("qqmusic", qr.data)
                 self._ui(lambda: w["status_var"].set("请使用 QQ音乐 App 扫码"))
 
                 start = time.time()
                 while self._polling and time.time() - start < 300:
                     try:
-                        r = await client.login.check_qr_code(identifier)
+                        result = await client.login.check_qrcode(qr)
                     except Exception:
                         await asyncio.sleep(2)
                         continue
 
-                    state = r.get("state") or r.get("status")
-                    if state in (0, "0"):
-                        self._ui(lambda: w["status_var"].set("等待扫码…"))
-                    elif state in (1, "1"):
-                        self._ui(lambda: w["status_var"].set("已扫码，等待确认"))
-                    elif state in (2, "2", "ok", "success"):
-                        cookie = r.get("cookie") or r.get("cookie_str") or ""
-                        if not cookie and client.credential:
-                            try:
-                                cookie = client.credential.as_dict().get("cookie", "")
-                            except Exception:
-                                cookie = str(client.credential)
-                        self._save_cookie("qqmusic", cookie)
+                    if result.event == QRCodeLoginEvents.DONE and result.credential:
+                        cred_json = json.dumps(
+                            result.credential.model_dump(),
+                            ensure_ascii=False,
+                        )
+                        self._save_cookie("qqmusic", cred_json)
                         self._ui(lambda: w["status_var"].set("✅ QQ音乐登录成功"))
                         self._ui(lambda: self._on_login_ok("qqmusic"))
                         return
@@ -270,14 +264,15 @@ class LoginDialog(tk.Toplevel):
 
         async def flow():
             from bilibili_api import login_v2
+
             qr = login_v2.QrCodeLogin(platform=login_v2.QrCodeLoginChannel.WEB)
             await qr.generate_qrcode()
 
-            pic_bytes = qr.get_qrcode_picture()
-            if pic_bytes:
-                self._show_qr_bytes("bilibili", pic_bytes)
+            pic = qr.get_qrcode_picture()
+            if pic and pic.content:
+                self._show_qr_bytes("bilibili", pic.content)
             else:
-                content = getattr(qr, "get_qrcode_url", lambda: None)()
+                content = qr.get_qrcode_terminal()
                 if not content:
                     raise RuntimeError("无法获取 B 站二维码")
                 self._show_qr("bilibili", content)
@@ -292,9 +287,9 @@ class LoginDialog(tk.Toplevel):
                     await asyncio.sleep(2)
                     continue
 
-                if state == login_v2.QrCodeLoginState.SCANING:
+                if state == login_v2.QrCodeLoginEvents.CONF:
                     self._ui(lambda: w["status_var"].set("已扫码，等待确认"))
-                elif state == login_v2.QrCodeLoginState.CONFIRMED:
+                elif state == login_v2.QrCodeLoginEvents.DONE:
                     cred = qr.get_credential()
                     self.cfg.setdefault("bilibili", {})
                     self.cfg["bilibili"]["sessdata"] = cred.sessdata
@@ -303,7 +298,7 @@ class LoginDialog(tk.Toplevel):
                     self._ui(lambda: w["status_var"].set("✅ B站登录成功"))
                     self._ui(lambda: self._on_login_ok("bilibili"))
                     return
-                elif state == login_v2.QrCodeLoginState.EXPIRED:
+                elif state == login_v2.QrCodeLoginEvents.TIMEOUT:
                     self._ui(lambda: w["status_var"].set("❌ 二维码已过期"))
                     return
                 await asyncio.sleep(2)
@@ -320,14 +315,14 @@ class LoginDialog(tk.Toplevel):
 
         if platform == "netease":
             try:
-                from pyncm.apis.login import LoginViaCellPhone
+                from pyncm.apis.login import LoginViaCellphone
                 from pyncm import GetCurrentSession
-                LoginViaCellPhone(phone=phone, password=pwd)
+                LoginViaCellphone(phone=phone, password=pwd)
                 cookies = GetCurrentSession().cookies.get_dict()
                 music_u = cookies.get("MUSIC_U", "")
                 if not music_u:
                     raise RuntimeError("登录成功但未拿到 MUSIC_U")
-                self._save_cookie("netease", f"MUSIC_U={music_u}")
+                self._save_cookie("netease", music_u)
                 messagebox.showinfo("成功", "网易云登录成功")
                 self._on_login_ok("netease")
             except Exception as e:
@@ -382,7 +377,10 @@ class LoginDialog(tk.Toplevel):
                 pass
 
     def _ui(self, fn):
-        self.after(0, fn)
+        try:
+            self.after(0, fn)
+        except Exception:
+            pass
 
     def _on_close(self):
         self._polling = False
