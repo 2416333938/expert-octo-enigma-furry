@@ -28,10 +28,17 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
+    """读取配置；缺省键用默认值补齐，兼容旧版本配置文件"""
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return DEFAULT_CONFIG.copy()
+            data = json.load(f)
+        for key, value in data.items():
+            if isinstance(value, dict) and isinstance(cfg.get(key), dict):
+                cfg[key].update(value)
+            else:
+                cfg[key] = value
+    return cfg
 
 
 def save_config(cfg):
