@@ -71,10 +71,6 @@
   },
   {
    "optionDest": "datas",
-   "value": "D:/c++/py/music_player/__pycache__;__pycache__/"
-  },
-  {
-   "optionDest": "datas",
    "value": "D:/c++/py/music_player/platforms;platforms/"
   }
  ],
