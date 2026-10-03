@@ -1,6 +1,6 @@
 #include<bits/stdc++.h>
 using namespace std;
-int n,m,M[1000001]
+int n,m,M[1000001];
 int main() {
 	cin>>n>>m;
 	for(int i=1; i<n; i++) {
