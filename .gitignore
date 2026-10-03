@@ -4,14 +4,19 @@
 *.obj
 a.out
 
+# 本地登录凭证（含真实 Cookie，切勿提交；见 py/music_player/.gitignore）
+py/music_player/config.json
+
 # 过大的 Scratch 工程（386 MB，超出 GitHub 单文件 100 MB 限制）
 # 本地保留，不纳入版本控制
 sb3/宝可梦GUI.sb3
-py/sync_config.json
+
+# 压缩包 / 归档
+*.rar
+
 # 系统 / 编辑器
 Thumbs.db
 desktop.ini
 .vs/
 .vscode/
 *.swp
-py/sync_config.json
